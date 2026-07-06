@@ -1,0 +1,54 @@
+# ==========================================
+# FastAPI & Python (Backend)
+# ==========================================
+# Targets fastapienv inside any subfolder
+**/fastapienv/
+**/venv/
+**/.venv/
+
+# Python cache files
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# Backend environment secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Large files
+**/quran_metadata.json
+**/quran_model_final.pt
+**/silero_vad.jit
+
+# ==========================================
+# Flutter & Dart (Frontend)
+# ==========================================
+**/build/
+**/.dart_tool/
+**/.pub-cache/
+**/.pub/
+**/.packages
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/doc/api/
+
+# Android specific builds
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+
+# iOS & Web specific artifacts
+**/ios/Flutter/.last_build_id
+**/ios/Runner/GeneratedPluginRegistrant.*
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/lib/generated_plugin_registrant.dart
+
+# ==========================================
+# Global / OS / IDEs
+# ==========================================
+.DS_Store
+Thumbs.db
+**/.vscode/
+**/.idea/
