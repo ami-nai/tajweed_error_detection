@@ -1,5 +1,4 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_riverpod/legacy.dart';
 import '../../data/datasources/recitation_remote_datasource.dart';
 import '../../data/repositories/recitation_repository_impl.dart';
 import '../../domain/entities/recitation_result.dart';
@@ -7,60 +6,185 @@ import '../../domain/repositories/recitation_repository.dart';
 import 'dart:async';
 import 'dart:convert';
 
+final Map<int, Map<int, List<String>>> quranTextDatabase = {
+  111: {
+    1: ["تَبَّتْ", "يَدَا", "أَبِي", "لَهَبٍ", "وَتَبَّ"],
+    2: ["مَا", "أَغْنَىٰ", "عَنْهُ", "مَالُهُ", "وَمَا", "كَسَبَ"],
+    3: ["سَيَصْلَىٰ", "نَارًا", "ذَاتَ", "لَهَبٍ"],
+    4: ["وَامْرَأَتُهُ", "حَمَّالَةَ", "الْحَطَبِ"],
+    5: ["فِي", "جِيدِهَا", "حَبْلٌ", "مِّن", "مَّسَدٍ"],
+  },
+  112: {
+    1: ["قُلْ", "هُوَ", "اللَّهُ", "أَحَدٌ"],
+    2: ["اللَّهُ", "الصَّمَدُ"],
+    3: ["لَمْ", "يَلِدْ", "وَلَمْ", "يُولَدْ"],
+    4: ["وَلَمْ", "يَكُنْ", "لَهُ", "كُفُوًا", "أَحَدٌ"],
+  },
+  113: {
+    1: ["قُلْ", "أَعُوذُ", "بِرَبِّ", "الْفَلَقِ"],
+    2: ["مِن", "شَرِّ", "مَا", "خَلَقَ"],
+    3: ["وَمِن", "شَرِّ", "غَاسِقٍ", "إِذَا", "وَقَبَ"],
+    4: ["وَمِن", "شَرِّ", "النَّفَّاثَاتِ", "فِي", "الْعُقَدِ"],
+    5: ["وَمِن", "شَرِّ", "حَاسِدٍ", "إِذَا", "حَسَدَ"],
+  },
+  114: {
+    1: ["قُلْ", "أَعُوذُ", "بِرَبِّ", "النَّاسِ"],
+    2: ["مَلِكِ", "النَّاسِ"],
+    3: ["إِلَٰهِ", "النَّاسِ"],
+    4: ["مِن", "شَرِّ", "الْوَسْوَاسِ", "الْخَنَّاسِ"],
+    5: ["الَّذِي", "يُوَسْوِسُ", "فِي", "صُدُورِ", "النَّاسِ"],
+    6: ["مِنَ", "الْجِنَّةِ", "وَالنَّاسِ"],
+  }
+};
+
 final dataSourceProvider = Provider((ref) {
-  // IMPORTANT: For a physical device, replace '192.168.x.x' below with your 
-  // computer's local IP address (e.g., 'ws://192.168.1.10:8000')
-  return RecitationRemoteDataSource('ws://192.168.1.111:8000'); 
+  return RecitationRemoteDataSource('ws://192.168.1.113:8000');
 });
 
 final repositoryProvider = Provider<RecitationRepository>((ref) {
   return RecitationRepositoryImpl(ref.watch(dataSourceProvider));
 });
 
-class RecitationNotifier extends StateNotifier<RecitationResult> {
-  final RecitationRepository _repository;
+class RecitationNotifier extends Notifier<RecitationResult> {
   StreamSubscription? _serverSubscription;
 
-  RecitationNotifier(this._repository) : super(RecitationResult(status: RecitationStatus.idle));
+  @override
+  RecitationResult build() {
+    ref.onDispose(() {
+      _serverSubscription?.cancel();
+    });
+
+    return RecitationResult(
+      words: quranTextDatabase[112]![1]!.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
+      status: RecitationStatus.idle,
+      selectedSurah: 112,
+      selectedAyah: 1,
+    );
+  }
+
+  String _normalizeArabic(String text) {
+    final RegExp diacritics = RegExp(r'[\u064B-\u065F\u0670\u0654]');
+    String normalized = text.replaceAll(diacritics, '');
+    normalized = normalized.replaceAll(RegExp(r'[إأآا]'), 'ا');
+    normalized = normalized.replaceAll(RegExp(r'[ىي]'), 'ي');
+    normalized = normalized.replaceAll(RegExp(r'[ةه]'), 'ه');
+    return normalized.trim();
+  }
+
+  void updateSelection(int surahId, int ayahId) {
+    final staticWords = quranTextDatabase[surahId]?[ayahId] ?? [];
+    state = state.copyWith(
+      selectedSurah: surahId,
+      selectedAyah: ayahId,
+      status: RecitationStatus.idle,
+      words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
+    );
+  }
 
   Future<void> startReciting(int surahId, int ayahId) async {
     try {
-      state = RecitationResult(status: RecitationStatus.recording);
-      
-      // Clean Architecture: Call the repository, not the data source directly
-      final serverStream = await _repository.startStreaming(surahId, ayahId);
-      
-      _serverSubscription = serverStream.listen((event) {
-        final data = jsonDecode(event);
-        
-        RecitationStatus newStatus;
-        switch(data['status']) {
-          case 'advance': newStatus = RecitationStatus.success; break;
-          case 'retry': newStatus = RecitationStatus.retry; break;
-          default: newStatus = RecitationStatus.error;
-        }
+      print("🔵 [RECITATION PROV] Preparing stream for Surah: $surahId, Ayah: $ayahId");
+      await _serverSubscription?.cancel();
 
-        state = RecitationResult(
-          status: newStatus,
-          accuracy: data['accuracy'],
-          rawText: data['raw_text'],
-          expectedPhonemes: data['expected_phonemes'],
-          predictedPhonemes: data['predicted_phonemes'],
-        );
-      });
-      
+      final staticWords = quranTextDatabase[surahId]?[ayahId] ?? [];
+      state = state.copyWith(
+        status: RecitationStatus.recording,
+        words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
+      );
+
+      final repository = ref.read(repositoryProvider);
+      print("🔵 [RECITATION PROV] Connecting to server stream...");
+      final serverStream = await repository.startStreaming(surahId, ayahId);
+      print("🟢 [RECITATION PROV] Stream connection successfully initiated!");
+
+      _serverSubscription = serverStream.listen(
+        (event) {
+          print("📥 [SERVER EVENT RECEIVED]: $event");
+
+          try {
+            final Map<String, dynamic> data = jsonDecode(event);
+            List<String> recognizedWords = [];
+
+            // Diagnostic checks to discover the backend data shape
+            if (data.containsKey('words')) {
+              print("🔍 [PARSER] Found 'words' key in payload");
+              if (data['words'] is List) {
+                for (var item in data['words']) {
+                  if (item is Map) {
+                    if (item['is_read'] == true || item['isRead'] == true) {
+                      recognizedWords.add(item['text']?.toString() ?? '');
+                    }
+                  } else if (item is String) {
+                    recognizedWords.add(item);
+                  }
+                }
+              }
+            } else if (data.containsKey('transcript')) {
+              print("🔍 [PARSER] Found 'transcript' string key: ${data['transcript']}");
+              recognizedWords = (data['transcript'] as String).split(' ');
+            } else if (data.containsKey('text')) {
+              print("🔍 [PARSER] Found 'text' string key: ${data['text']}");
+              recognizedWords = (data['text'] as String).split(' ');
+            } else {
+              print("⚠️ [PARSER WARNING] Unexpected payload keys. Available keys: ${data.keys.toList()}");
+            }
+
+            if (recognizedWords.isEmpty) {
+              print("⚠️ [PARSER] Processed recognized words array is empty. Nothing to match.");
+            } else {
+              print("🎯 [PARSER] Normalized search arrays: $recognizedWords");
+            }
+
+            final normalizedBackend = recognizedWords.map((w) => _normalizeArabic(w)).toList();
+
+            final mergedWords = state.words.map((localWord) {
+              final normalizedLocal = _normalizeArabic(localWord.text);
+              bool isWordRead = localWord.isRead || normalizedBackend.contains(normalizedLocal);
+              
+              if (normalizedBackend.contains(normalizedLocal)) {
+                print("✨ [MATCH FOUND]: Local '$normalizedLocal' matched backend input!");
+              }
+
+              return WordTrackResult(
+                text: localWord.text,
+                isRead: isWordRead,
+              );
+            }).toList();
+
+            state = state.copyWith(
+              words: mergedWords,
+              realText: data['real_text']?.toString() ?? state.realText,
+              expected: data['expected']?.toString() ?? state.expected,
+              predicted: data['predicted']?.toString() ?? state.predicted,
+              accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
+            );
+            print("📈 [STATE UPDATE] Words highlighted status: ${state.words.map((w) => '${w.text}:${w.isRead}').toList()}");
+            
+          } catch (parseError) {
+            print("❌ [PARSER ERROR] Error interpreting JSON payload: $parseError");
+          }
+        },
+        onError: (error) {
+          print("❌ [STREAM ERROR] The server stream emitted an error: $error");
+          state = state.copyWith(status: RecitationStatus.error);
+          stopReciting();
+        },
+        onDone: () {
+          print("🔌 [STREAM CLOSED] The server connection closed down automatically (onDone).");
+        }
+      );
     } catch (e) {
-      state = RecitationResult(status: RecitationStatus.error);
+      print("❌ [CRITICAL FAILURE] Failed during startReciting initiation sequence: $e");
+      state = state.copyWith(status: RecitationStatus.error);
     }
   }
 
   Future<void> stopReciting() async {
+    print("🔵 [RECITATION PROV] Manually terminating stream...");
     await _serverSubscription?.cancel();
-    await _repository.stopStreaming();
-    state = RecitationResult(status: RecitationStatus.idle);
+    await ref.read(repositoryProvider).stopStreaming();
+    state = state.copyWith(status: RecitationStatus.idle);
   }
 }
 
-final recitationProvider = StateNotifierProvider<RecitationNotifier, RecitationResult>((ref) {
-  return RecitationNotifier(ref.watch(repositoryProvider));
-});
+final recitationProvider = NotifierProvider<RecitationNotifier, RecitationResult>(RecitationNotifier.new);

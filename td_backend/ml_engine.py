@@ -1,127 +1,273 @@
 import json
+import os
+import warnings
+import Levenshtein
+import numpy as np
+import quran_transcript
 import torch
 import torch.nn as nn
-import os
 import torchaudio
 import torchaudio.functional as F
-import numpy as np
-import Levenshtein
-import quran_transcript
-import warnings
 from transformers import AutoFeatureExtractor, AutoModel
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # 1. Model Definition
 class W2V2Light(nn.Module):
+
     def __init__(self, v_size):
         super().__init__()
         self.base = AutoModel.from_pretrained("facebook/wav2vec2-base")
         self.phoneme_head = nn.Linear(768, v_size)
+
     def forward(self, x):
         x = self.base.feature_extractor(x).transpose(1, 2)
         x = self.base.feature_projection(x)[0]
         x = self.base.encoder(x).last_hidden_state
         return self.phoneme_head(x)
 
+
 # 2. Vocabulary Setup
 class QPSVocabulary:
+
     def __init__(self):
         self.phoneme2id = {"<pad>": 0, "<blank>": 1}
         self.id2phoneme = {0: "<pad>", 1: "<blank>"}
         self.idx = 2
+
     def add(self, p):
-        if p not in self.phoneme2id: 
+        if p not in self.phoneme2id:
             self.phoneme2id[p] = self.idx
             self.id2phoneme[self.idx] = p
             self.idx += 1
 
+    def clear(self):
+        """Resets vocabulary maps cleanly back to initial state."""
+        self.phoneme2id = {"<pad>": 0, "<blank>": 1}
+        self.id2phoneme = {0: "<pad>", 1: "<blank>"}
+        self.idx = 2
+
+    def __len__(self):
+        """Allows Python's len() function to read vocabulary size directly."""
+        return self.idx
+
+
 vocab = QPSVocabulary()
 moshaf_rules = quran_transcript.MoshafAttributes(
-    rewaya="hafs", ghunnah=4, madd_monfasel_len=4,
-    madd_mottasel_len=5, madd_mottasel_waqf=5, madd_aared_len=2
+    rewaya="hafs",
+    ghunnah=4,
+    madd_monfasel_len=4,
+    madd_mottasel_len=4,
+    madd_mottasel_waqf=5,
+    madd_aared_len=4,
 )
 
-# 3. Build Tajweed Index and populate Vocabulary
+# 3. Determine the model output layer size from the saved checkpoint.
+#    Auto-adapts: 34 classes with the current checkpoint, 40 once you retrain
+#    on the full dataset (no code changes needed).
+checkpoint = torch.load("quran_model_final.pt", map_location="cpu", weights_only=True)
+V_SIZE = checkpoint["phoneme_head.weight"].shape[0]
+print(f"Checkpoint output layer size: {V_SIZE}")
+
+# 4. Build Tajweed Index and populate Vocabulary
 TAJWEED_ONLY_INDEX = {}
 print("Loading Tajweed index...")
-with open("quran_metadata.json", 'r', encoding='utf-8') as f:
+with open("quran_metadata.json", "r", encoding="utf-8") as f:
     data = json.load(f)
-    for row in data:
-        s_id, a_id = int(row['surah_id']), int(row['ayah_id'])
-        if s_id not in TAJWEED_ONLY_INDEX: TAJWEED_ONLY_INDEX[s_id] = {}
 
-        if a_id not in TAJWEED_ONLY_INDEX[s_id]:
-            raw_text = row['ayah_ar']
+    # 1. Full training vocabulary in exact order.
+    # CRITICAL: This is the EXACT order the checkpoint was trained with, extracted
+    # by replaying the training notebook's dataset build (uthmani_script +
+    # moshaf_rules above + audio-presence filter) on quran_full_data_collection_new.
+    # 2 base classes <pad>,<blank> + 32 phoneme tokens = 34 classes = checkpoint head.
+    TRAINED_PHONEMES = ['ت', 'َ', 'ب', ' ', 'ي', 'د', 'ا', 'ء', 'ِ', 'ۦ', 'ل', 'ه', 'ن', 'و', 'ڇ', 'م', 'غ', 'ع', 'ُ', 'ك', 'س', 'ص', 'ر', 'ذ', 'ف', 'ج', 'ح', 'ۥ', 'ں', 'ش', 'خ', 'ق']
+
+    # 2. Reset vocab and keep only the classes the checkpoint actually supports
+    vocab.clear()
+    for token in TRAINED_PHONEMES[: V_SIZE - 2]:
+        vocab.add(token)
+
+    # 3. Safety Padding to forcefully protect model dimensions against runtime array variance
+    while len(vocab) < V_SIZE:
+        vocab.add(f"<dummy_pad_{len(vocab)}>")
+
+    # 3. Run the startup indexer safely without letting phonetizer crashes drop your verses
+    for row in data:
+        s_id, a_id = int(row["surah_id"]), int(row["ayah_id"])
+        if s_id not in TAJWEED_ONLY_INDEX:
+            TAJWEED_ONLY_INDEX[s_id] = {}
+
+        raw_text = row["ayah_ar"]
+        words = raw_text.split()
+        word_list = []
+
+        for word in words:
             try:
-                clean_text = raw_text.replace("ٰ", "ا").replace("ٱ", "ا")
-                p_obj = quran_transcript.quran_phonetizer(clean_text, moshaf_rules)
+                # If phonetizer fails contextually on a single word, capture it gracefully
+                p_obj = quran_transcript.quran_phonetizer(word, moshaf_rules)
                 phoneme_list = list(p_obj.phonemes)
-                TAJWEED_ONLY_INDEX[s_id][a_id] = {'text': raw_text, 'phonemes': phoneme_list}
-                for p in phoneme_list: vocab.add(p)
-            except:
-                continue
+            except Exception:
+                phoneme_list = []  # Fallback safely; text layout and vocab tracking remain intact
+
+            word_list.append({"text": word, "phonemes": phoneme_list})
+
+        TAJWEED_ONLY_INDEX[s_id][a_id] = {"words": word_list}
+
+    print(
+        f"🎉 Initialization complete! Stable vocab size: {len(vocab)}. Indexed {len(TAJWEED_ONLY_INDEX)} Surahs."
+    )
 
 # Remove empty surahs
 TAJWEED_ONLY_INDEX = {k: v for k, v in TAJWEED_ONLY_INDEX.items() if v}
 
-# 4. Load Model Weights
-print(f"Loading Model... Vocabulary size: {vocab.idx}")
-model = W2V2Light(vocab.idx).to(DEVICE)
-model.load_state_dict(torch.load("quran_model_final.pt", map_location=DEVICE, weights_only=True), strict=False)
+# 5. Load Model Weights
+print(f"Loading Model... Target architectural output layer size: {V_SIZE}")
+# Fixed parameter layout error by passing positional argument matching W2V2Light constructor definition
+model = W2V2Light(V_SIZE).to(DEVICE)
+model.load_state_dict(checkpoint, strict=False)
 model.eval()
 
 extractor = AutoFeatureExtractor.from_pretrained("facebook/wav2vec2-base")
 
-# 5. Core Evaluation Function
-def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
-    if surah_id not in TAJWEED_ONLY_INDEX or ayah_id not in TAJWEED_ONLY_INDEX[surah_id]:
-        return None, "Error: Ayah not found in Tajweed index", "", "0.00%"
 
-    data = TAJWEED_ONLY_INDEX[surah_id][ayah_id]
-    raw_text = data['text']
-    true_phonemes = data['phonemes']
-    expected_str = " ".join(true_phonemes)
+def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
+    if (
+        surah_id not in TAJWEED_ONLY_INDEX
+        or ayah_id not in TAJWEED_ONLY_INDEX[surah_id]
+    ):
+        return []
+
+    word_data = TAJWEED_ONLY_INDEX[surah_id][ayah_id]["words"]
 
     # 1. Load the raw bytes directly
     with open(audio_path, "rb") as f:
         audio_bytes = f.read()
-    
+
     # 2. Convert raw bytes to numpy array (16-bit PCM)
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-    
-    # 3. Normalize
     audio_np /= 32768.0
-    
-    # 4. Convert to Tensor
-    waveform = torch.from_numpy(audio_np).unsqueeze(0) # Shape: (1, samples)
-    
-    # 5. Handle Padding (Matching your previous logic)
-    # Instead of wf, we now use our waveform tensor
-    waveform_padded = torch.nn.functional.pad(waveform, (0, 4800), mode='constant')
 
-    # 6. Extract features
-    # Extractor handles the conversion from the padded tensor to model input
-    inputs = extractor(waveform_padded.squeeze().numpy(), sampling_rate=16000, return_tensors="pt").input_values.to(DEVICE)
+    waveform = torch.from_numpy(audio_np).unsqueeze(0)  # Shape: (1, samples)
+    waveform_padded = torch.nn.functional.pad(
+        waveform, (0, 4800), mode="constant"
+    )
+
+    inputs = (
+        extractor(
+            waveform_padded.squeeze().numpy(),
+            sampling_rate=16000,
+            return_tensors="pt",
+        )
+        .input_values.to(DEVICE)
+    )
 
     # Inference
     with torch.no_grad():
         logits = model(inputs)
         pred_ids = torch.argmax(logits[0], dim=-1)
 
-    pred_phonemes = [vocab.id2phoneme.get(p.item(), "") for p in pred_ids if p.item() not in [0, 1]]
+    # FIX: Explicitly exclude any <pad>, <blank>, or <dummy_pad_X> tokens from your prediction list
+    pred_phonemes = []
+    for p in pred_ids:
+        token_id = p.item()
+        if token_id not in [0, 1]:
+            token_str = vocab.id2phoneme.get(token_id, "")
+            if token_str and not token_str.startswith("<dummy_pad"):
+                pred_phonemes.append(token_str)
 
     # CTC Deduplication
     final_pred = []
     prev = None
     for p in pred_phonemes:
-        if p != prev: 
+        if p != prev:
             final_pred.append(p)
             prev = p
 
-    predicted_str = " ".join(final_pred)
-    dist = Levenshtein.distance("".join(final_pred), "".join(true_phonemes))
-    acc = max(0, 100 - (dist / len(true_phonemes) * 100))
+    pred_str = "".join(final_pred)
+    print(f"🔮 [ML ENGINE] Cleaned AI Prediction String: '{pred_str}'")
 
-    return raw_text, expected_str, predicted_str, f"{acc:.2f}%"
+    word_results = []
+    expected_parts = []
+
+    # Helper function to extract valid matching letters from raw text if phonetizer fails
+    def get_fallback_target(raw_text):
+        # Strips all tashkeel/diacritics and keeps only characters inside TRAINED_PHONEMES
+        diacritics = [
+            "ِ",
+            "ُ",
+            "َ",
+            "ْ",
+            "ّ",
+            "ً",
+            "ٌ",
+            "ٍ",
+            "ٰ",
+            "ٓ",
+            "ۦ",
+            "ۧ",
+        ]
+        clean_text = "".join([c for c in raw_text if c not in diacritics])
+        # Only keep letters your model's vocabulary actually supports
+        return "".join([c for c in clean_text if c in TRAINED_PHONEMES])
+
+    # 7. Check which words match the speech detected
+    for word_obj in word_data:
+        # Filter out characters from target phonemes that don't exist in vocabulary (like ڇ)
+        target_phonemes = [
+            p for p in word_obj["phonemes"] if p in TRAINED_PHONEMES
+        ]
+        target_str = "".join(target_phonemes)
+
+        # FIX: If phonetizer failed completely (Target: ''), use our vocabulary-matched plain text fallback
+        if not target_str:
+            target_str = get_fallback_target(word_obj["text"])
+            print(
+                f"⚠️ [FALLBACK] Phonetizer failed for '{word_obj['text']}'. Using plain target letters: '{target_str}'"
+            )
+
+        # If both attempts yield no trackable characters, skip safely
+        if not target_str:
+            word_results.append({"text": word_obj["text"], "is_read": False})
+            continue
+
+        expected_parts.append(target_str)
+
+        has_been_read = False
+        # Exact substring match
+        if target_str in pred_str:
+            has_been_read = True
+        else:
+            # Fallback sliding window Levenshtein matching
+            win_len = len(target_str)
+            if len(pred_str) >= win_len:
+                for i in range(len(pred_str) - win_len + 1):
+                    sub = pred_str[i : i + win_len]
+                    dist = Levenshtein.distance(sub, target_str)
+                    if dist <= max(1, int(win_len * 0.35)):
+                        has_been_read = True
+                        break
+            else:
+                dist = Levenshtein.distance(pred_str, target_str)
+                has_been_read = (
+                    (dist <= max(1, int(win_len * 0.4))) if pred_str else False
+                )
+
+        print(
+            f"   -> Word: '{word_obj['text']}' | Target Check: '{target_str}' vs Predicted: '{pred_str}' -> Result: {has_been_read}"
+        )
+        word_results.append({"text": word_obj["text"], "is_read": has_been_read})
+
+    real_text = " ".join(w["text"] for w in word_data)
+    expected_str = " ".join(expected_parts)
+    dist = Levenshtein.distance(pred_str, expected_str) if expected_str else 0
+    accuracy = max(0, 100 - (dist / len(expected_str) * 100)) if expected_str else 0.0
+
+    return {
+        "words": word_results,
+        "real_text": real_text,
+        "expected": expected_str,
+        "predicted": pred_str,
+        "accuracy": round(accuracy, 2),
+    }

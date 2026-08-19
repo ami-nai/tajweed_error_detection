@@ -20,6 +20,9 @@
 **/quran_metadata.json
 **/quran_model_final.pt
 **/silero_vad.jit
+**/notebook.ipynb
+**/quran_full_data_collection_new_send.zip
+**/WavVec2_base.ipynb
 
 # ==========================================
 # Flutter & Dart (Frontend)
