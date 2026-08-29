@@ -203,10 +203,10 @@ class RecitationPage extends ConsumerWidget {
                   color: Colors.redAccent.withOpacity(0.1),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: const Text(
-                  'Failed to connect to the server. Please make sure the backend is running at ws://192.168.1.113:8000.',
+                child: Text(
+                  'Failed to connect to the server. Please make sure the backend is running at $kBackendUrl',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w600),
+                  style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w600),
                 ),
               )
             else if (recitationState.status == RecitationStatus.recording)

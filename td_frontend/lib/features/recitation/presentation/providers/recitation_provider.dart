@@ -41,8 +41,16 @@ int maxAyahsForSurah(int surahId) {
   return quranTextDatabase[surahId]?.length ?? 0;
 }
 
+// Backend WebSocket base URL. Override at build time with:
+//   flutter build apk --dart-define=BACKEND_URL=wss://your-host.example
+// Defaults to the local dev server.
+const String kBackendUrl = String.fromEnvironment(
+  'BACKEND_URL',
+  defaultValue: 'ws://192.168.1.113:8000',
+);
+
 final dataSourceProvider = Provider((ref) {
-  return RecitationRemoteDataSource('ws://192.168.1.113:8000');
+  return RecitationRemoteDataSource(kBackendUrl);
 });
 
 final repositoryProvider = Provider<RecitationRepository>((ref) {

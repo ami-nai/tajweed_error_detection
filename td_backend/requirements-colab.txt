@@ -1,0 +1,15 @@
+# CPU-only requirements for the free-hosted backend (Google Colab / cloud).
+# Colab already ships torch + transformers + numpy, so only the extras that
+# main.py / ml_engine.py actually need at runtime are listed here.
+fastapi
+uvicorn[standard]
+websockets
+numpy
+soundfile
+quran-transcript
+fuzzysearch
+python-Levenshtein
+rapidfuzz
+Levenshtein
+huggingface_hub
+safetensors
