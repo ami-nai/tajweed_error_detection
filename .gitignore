@@ -19,6 +19,7 @@
 # Large files
 **/quran_metadata.json
 **/quran_model_final.pt
+**/quran_model_final-alif-hamja_correction.pt
 **/silero_vad.jit
 **/notebook.ipynb
 **/quran_full_data_collection_new_send.zip

@@ -64,10 +64,27 @@ moshaf_rules = quran_transcript.MoshafAttributes(
     madd_aared_len=4,
 )
 
-# 3. Determine the model output layer size from the saved checkpoint.
-#    Auto-adapts: 34 classes with the current checkpoint, 40 once you retrain
-#    on the full dataset (no code changes needed).
-checkpoint = torch.load("quran_model_final.pt", map_location="cpu", weights_only=True)
+# 3. Phonetizer normalization (same as training notebook: problemalif.ipynb)
+def normalize_initial_hamzat_wasl(text):
+    text = text.strip()
+    if text.startswith('ٱل') or text.startswith('ال'):
+        return 'ءَ' + text[1:]
+    elif text.startswith('ٱ') or text.startswith('ا'):
+        return 'ءِ' + text[1:]
+    return text
+
+def safe_phonetizer(text, rules):
+    normalized = normalize_initial_hamzat_wasl(text)
+    try:
+        return list(quran_transcript.quran_phonetizer(normalized, rules).phonemes)
+    except Exception:
+        try:
+            return list(quran_transcript.quran_phonetizer(text, rules).phonemes)
+        except Exception:
+            return [c for c in normalized if c not in ' ۚۛۗۖ ۘۜ\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\u0670']
+
+# 4. Determine the model output layer size from the saved checkpoint.
+checkpoint = torch.load("quran_model_final-alif-hamja_correction.pt", map_location="cpu", weights_only=True)
 V_SIZE = checkpoint["phoneme_head.weight"].shape[0]
 print(f"Checkpoint output layer size: {V_SIZE}")
 
@@ -81,8 +98,8 @@ with open("quran_metadata.json", "r", encoding="utf-8") as f:
     # CRITICAL: This is the EXACT order the checkpoint was trained with, extracted
     # by replaying the training notebook's dataset build (uthmani_script +
     # moshaf_rules above + audio-presence filter) on quran_full_data_collection_new.
-    # 2 base classes <pad>,<blank> + 32 phoneme tokens = 34 classes = checkpoint head.
-    TRAINED_PHONEMES = ['ت', 'َ', 'ب', ' ', 'ي', 'د', 'ا', 'ء', 'ِ', 'ۦ', 'ل', 'ه', 'ن', 'و', 'ڇ', 'م', 'غ', 'ع', 'ُ', 'ك', 'س', 'ص', 'ر', 'ذ', 'ف', 'ج', 'ح', 'ۥ', 'ں', 'ش', 'خ', 'ق']
+    # 2 base classes <pad>,<blank> + 37 phoneme tokens = 39 classes = checkpoint head.
+    TRAINED_PHONEMES = ['ت', 'َ', 'ب', ' ', 'ي', 'د', 'ا', 'ء', 'ِ', 'ۦ', 'ل', 'ه', 'ن', 'و', 'ڇ', 'م', 'غ', 'ع', 'ُ', 'ك', 'س', 'ص', 'ر', 'ذ', 'أ', 'ح', 'ة', 'ط', 'ف', 'ج', 'ق', 'ۥ', 'ں', 'ش', 'خ', 'ث', 'إ']
 
     # 2. Reset vocab and keep only the classes the checkpoint actually supports
     vocab.clear()
@@ -93,7 +110,7 @@ with open("quran_metadata.json", "r", encoding="utf-8") as f:
     while len(vocab) < V_SIZE:
         vocab.add(f"<dummy_pad_{len(vocab)}>")
 
-    # 3. Run the startup indexer safely without letting phonetizer crashes drop your verses
+    # 3. Run the startup indexer using full-ayah phonetization (same as training)
     for row in data:
         s_id, a_id = int(row["surah_id"]), int(row["ayah_id"])
         if s_id not in TAJWEED_ONLY_INDEX:
@@ -101,19 +118,22 @@ with open("quran_metadata.json", "r", encoding="utf-8") as f:
 
         raw_text = row["ayah_ar"]
         words = raw_text.split()
-        word_list = []
 
-        for word in words:
-            try:
-                # If phonetizer fails contextually on a single word, capture it gracefully
-                p_obj = quran_transcript.quran_phonetizer(word, moshaf_rules)
-                phoneme_list = list(p_obj.phonemes)
-            except Exception:
-                phoneme_list = []  # Fallback safely; text layout and vocab tracking remain intact
+        # Full-ayah phonetization (in-context cross-word rules preserved)
+        full_phonemes = safe_phonetizer(raw_text, moshaf_rules)
+        full_stream = "".join(full_phonemes)
+        segments = full_stream.split()
 
-            word_list.append({"text": word, "phonemes": phoneme_list})
+        if len(segments) == len(words):
+            word_list = [{"text": w, "phonemes": list(seg)} for w, seg in zip(words, segments)]
+        else:
+            # Fallback: per-word phonetization
+            word_list = []
+            for word in words:
+                phoneme_list = safe_phonetizer(word, moshaf_rules)
+                word_list.append({"text": word, "phonemes": phoneme_list})
 
-        TAJWEED_ONLY_INDEX[s_id][a_id] = {"words": word_list}
+        TAJWEED_ONLY_INDEX[s_id][a_id] = {"words": word_list, "expected_full": full_stream}
 
     print(
         f"🎉 Initialization complete! Stable vocab size: {len(vocab)}. Indexed {len(TAJWEED_ONLY_INDEX)} Surahs."
@@ -168,22 +188,20 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         logits = model(inputs)
         pred_ids = torch.argmax(logits[0], dim=-1)
 
-    # FIX: Explicitly exclude any <pad>, <blank>, or <dummy_pad_X> tokens from your prediction list
-    pred_phonemes = []
-    for p in pred_ids:
-        token_id = p.item()
-        if token_id not in [0, 1]:
-            token_str = vocab.id2phoneme.get(token_id, "")
-            if token_str and not token_str.startswith("<dummy_pad"):
-                pred_phonemes.append(token_str)
-
-    # CTC Deduplication
+    # CTC Decode: collapse adjacent duplicates FIRST (preserves madd/long vowels),
+    # THEN remove blanks/pads. Matches notebook training decode (cell 13).
     final_pred = []
     prev = None
-    for p in pred_phonemes:
-        if p != prev:
-            final_pred.append(p)
-            prev = p
+    for p in pred_ids:
+        token_id = p.item()
+        if token_id in [0, 1]:  # skip <pad>, <blank> during collapse
+            prev = None  # break adjacency across blanks
+            continue
+        token_str = vocab.id2phoneme.get(token_id, "")
+        if token_str and not token_str.startswith("<dummy_pad"):
+            if token_str != prev:
+                final_pred.append(token_str)
+            prev = token_str
 
     pred_str = "".join(final_pred)
     print(f"🔮 [ML ENGINE] Cleaned AI Prediction String: '{pred_str}'")
@@ -212,7 +230,16 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         # Only keep letters your model's vocabulary actually supports
         return "".join([c for c in clean_text if c in TRAINED_PHONEMES])
 
+    # Diacritics and Madd markers to strip for consonant-only matching
+    # (model may not predict these for unseen verses)
+    DIACRITICS = set('ًٌٍَُِّْٰٓۥۦۖۗۚۛۜ')
+
+    def strip_diacritics(s):
+        return "".join(c for c in s if c not in DIACRITICS)
+
     # 7. Check which words match the speech detected
+    pred_stripped = strip_diacritics(pred_str)
+
     for word_obj in word_data:
         # Filter out characters from target phonemes that don't exist in vocabulary (like ڇ)
         target_phonemes = [
@@ -234,33 +261,36 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
 
         expected_parts.append(target_str)
 
+        target_stripped = strip_diacritics(target_str)
+
         has_been_read = False
-        # Exact substring match
-        if target_str in pred_str:
+        # Exact substring match (compare consonant-only for robustness)
+        if target_stripped in pred_stripped:
             has_been_read = True
         else:
             # Fallback sliding window Levenshtein matching
-            win_len = len(target_str)
-            if len(pred_str) >= win_len:
-                for i in range(len(pred_str) - win_len + 1):
-                    sub = pred_str[i : i + win_len]
-                    dist = Levenshtein.distance(sub, target_str)
+            win_len = len(target_stripped)
+            if len(pred_stripped) >= win_len:
+                for i in range(len(pred_stripped) - win_len + 1):
+                    sub = pred_stripped[i : i + win_len]
+                    dist = Levenshtein.distance(sub, target_stripped)
                     if dist <= max(1, int(win_len * 0.35)):
                         has_been_read = True
                         break
             else:
-                dist = Levenshtein.distance(pred_str, target_str)
+                dist = Levenshtein.distance(pred_stripped, target_stripped)
                 has_been_read = (
-                    (dist <= max(1, int(win_len * 0.4))) if pred_str else False
+                    (dist <= max(1, int(win_len * 0.4))) if pred_stripped else False
                 )
 
         print(
-            f"   -> Word: '{word_obj['text']}' | Target Check: '{target_str}' vs Predicted: '{pred_str}' -> Result: {has_been_read}"
+            f"   -> Word: '{word_obj['text']}' | Target Check: '{target_stripped}' vs Predicted: '{pred_stripped}' -> Result: {has_been_read}"
         )
         word_results.append({"text": word_obj["text"], "is_read": has_been_read})
 
     real_text = " ".join(w["text"] for w in word_data)
-    expected_str = " ".join(expected_parts)
+    expected_full = TAJWEED_ONLY_INDEX[surah_id][ayah_id].get("expected_full", "")
+    expected_str = expected_full if expected_full else " ".join(expected_parts)
     dist = Levenshtein.distance(pred_str, expected_str) if expected_str else 0
     accuracy = max(0, 100 - (dist / len(expected_str) * 100)) if expected_str else 0.0
 

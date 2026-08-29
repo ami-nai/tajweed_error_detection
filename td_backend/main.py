@@ -73,7 +73,7 @@ async def websocket_stream(websocket: WebSocket):
                 elif is_speaking:
                     silence_frames += 1
 
-                # If they were speaking but have been silent for ~0.25s (approx 8 frames)
+                # If they were speaking but have been silent for ~0.13s (approx 4 frames)
                 if is_speaking and silence_frames > 4 :
                     print("\n--- 🛑 Pause Detected. Processing Chunk ---")
 
