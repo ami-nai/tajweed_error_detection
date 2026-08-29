@@ -21,9 +21,8 @@
 **/quran_model_final.pt
 **/quran_model_final-alif-hamja_correction.pt
 **/silero_vad.jit
-**/notebook.ipynb
+**/*.ipynb
 **/quran_full_data_collection_new_send.zip
-**/WavVec2_base.ipynb
 
 # ==========================================
 # Flutter & Dart (Frontend)

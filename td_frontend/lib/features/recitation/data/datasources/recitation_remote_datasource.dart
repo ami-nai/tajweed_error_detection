@@ -66,15 +66,21 @@ class RecitationRemoteDataSource {
   RecitationRemoteDataSource(this.baseUrl);
 
   // Connects to the WebSocket and starts streaming audio data chunks immediately
-  Future<Stream<dynamic>> startStreamingRecording(int surahId, int ayahId) async {
+  // If ayahId is null, this is surah (sequential) mode; metadata omits ayah_id.
+  Future<Stream<dynamic>> startStreamingRecording(int surahId, int? ayahId) async {
     if (!await _audioRecorder.hasPermission()) {
       throw Exception("Microphone permission denied");
     }
 
     _channel = WebSocketChannel.connect(Uri.parse('$baseUrl/ws/recite'));
 
-    // 1. Send the identifying target Surah/Ayah metadata string 
-    _channel!.sink.add(jsonEncode({"surah_id": surahId, "ayah_id": ayahId}));
+    // 1. Send the identifying target Surah metadata string
+    //    (include ayah_id only in single-ayah mode)
+    final metadata = <String, dynamic>{"surah_id": surahId};
+    if (ayahId != null) {
+      metadata["ayah_id"] = ayahId;
+    }
+    _channel!.sink.add(jsonEncode(metadata));
 
     // 2. Open a continuous stream from the microphone (16-bit PCM)
     final audioStream = await _audioRecorder.startStream(

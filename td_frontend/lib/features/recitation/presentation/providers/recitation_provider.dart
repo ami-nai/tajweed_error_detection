@@ -37,6 +37,10 @@ final Map<int, Map<int, List<String>>> quranTextDatabase = {
   }
 };
 
+int maxAyahsForSurah(int surahId) {
+  return quranTextDatabase[surahId]?.length ?? 0;
+}
+
 final dataSourceProvider = Provider((ref) {
   return RecitationRemoteDataSource('ws://192.168.1.113:8000');
 });
@@ -71,95 +75,83 @@ class RecitationNotifier extends Notifier<RecitationResult> {
     return normalized.trim();
   }
 
+  void setMode(RecitationMode mode) {
+    if (mode == state.mode) return;
+    state = state.copyWith(mode: mode, status: RecitationStatus.idle);
+    if (mode == RecitationMode.singleAyah) {
+      _loadSingleAyah(state.selectedSurah, state.selectedAyah);
+    } else {
+      _loadSurah(state.selectedSurah);
+    }
+  }
+
   void updateSelection(int surahId, int ayahId) {
+    if (state.mode == RecitationMode.singleAyah) {
+      _loadSingleAyah(surahId, ayahId);
+    } else {
+      _loadSurah(surahId);
+    }
+  }
+
+  void _loadSingleAyah(int surahId, int ayahId) {
     final staticWords = quranTextDatabase[surahId]?[ayahId] ?? [];
     state = state.copyWith(
       selectedSurah: surahId,
       selectedAyah: ayahId,
       status: RecitationStatus.idle,
+      mode: RecitationMode.singleAyah,
       words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
     );
   }
 
-  Future<void> startReciting(int surahId, int ayahId) async {
+  void _loadSurah(int surahId) {
+    final ayahs = quranTextDatabase[surahId] ?? {};
+    final surahWords = <int, List<WordTrackResult>>{};
+    for (final entry in ayahs.entries) {
+      surahWords[entry.key] = entry.value
+          .map((w) => WordTrackResult(text: w, isRead: false))
+          .toList();
+    }
+    state = state.copyWith(
+      selectedSurah: surahId,
+      status: RecitationStatus.idle,
+      mode: RecitationMode.surah,
+      surahWords: surahWords,
+      ayahAccuracies: {},
+      surahAverage: 0,
+      currentAyah: 0,
+      nextAyah: 0,
+      words: [],
+    );
+  }
+
+  Future<void> startReciting({required int surahId, int? ayahId}) async {
     try {
-      print("🔵 [RECITATION PROV] Preparing stream for Surah: $surahId, Ayah: $ayahId");
       await _serverSubscription?.cancel();
 
-      final staticWords = quranTextDatabase[surahId]?[ayahId] ?? [];
-      state = state.copyWith(
-        status: RecitationStatus.recording,
-        words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
-      );
+      if (state.mode == RecitationMode.singleAyah && ayahId != null) {
+        final staticWords = quranTextDatabase[surahId]?[ayahId] ?? [];
+        state = state.copyWith(
+          status: RecitationStatus.recording,
+          words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
+        );
+      } else {
+        // Surah mode
+        _loadSurah(surahId);
+        state = state.copyWith(status: RecitationStatus.recording);
+      }
 
+      print("🔵 [RECITATION PROV] Preparing stream for Surah: $surahId, mode: ${state.mode}");
       final repository = ref.read(repositoryProvider);
-      print("🔵 [RECITATION PROV] Connecting to server stream...");
       final serverStream = await repository.startStreaming(surahId, ayahId);
       print("🟢 [RECITATION PROV] Stream connection successfully initiated!");
 
       _serverSubscription = serverStream.listen(
         (event) {
           print("📥 [SERVER EVENT RECEIVED]: $event");
-
           try {
             final Map<String, dynamic> data = jsonDecode(event);
-            List<String> recognizedWords = [];
-
-            // Diagnostic checks to discover the backend data shape
-            if (data.containsKey('words')) {
-              print("🔍 [PARSER] Found 'words' key in payload");
-              if (data['words'] is List) {
-                for (var item in data['words']) {
-                  if (item is Map) {
-                    if (item['is_read'] == true || item['isRead'] == true) {
-                      recognizedWords.add(item['text']?.toString() ?? '');
-                    }
-                  } else if (item is String) {
-                    recognizedWords.add(item);
-                  }
-                }
-              }
-            } else if (data.containsKey('transcript')) {
-              print("🔍 [PARSER] Found 'transcript' string key: ${data['transcript']}");
-              recognizedWords = (data['transcript'] as String).split(' ');
-            } else if (data.containsKey('text')) {
-              print("🔍 [PARSER] Found 'text' string key: ${data['text']}");
-              recognizedWords = (data['text'] as String).split(' ');
-            } else {
-              print("⚠️ [PARSER WARNING] Unexpected payload keys. Available keys: ${data.keys.toList()}");
-            }
-
-            if (recognizedWords.isEmpty) {
-              print("⚠️ [PARSER] Processed recognized words array is empty. Nothing to match.");
-            } else {
-              print("🎯 [PARSER] Normalized search arrays: $recognizedWords");
-            }
-
-            final normalizedBackend = recognizedWords.map((w) => _normalizeArabic(w)).toList();
-
-            final mergedWords = state.words.map((localWord) {
-              final normalizedLocal = _normalizeArabic(localWord.text);
-              bool isWordRead = localWord.isRead || normalizedBackend.contains(normalizedLocal);
-              
-              if (normalizedBackend.contains(normalizedLocal)) {
-                print("✨ [MATCH FOUND]: Local '$normalizedLocal' matched backend input!");
-              }
-
-              return WordTrackResult(
-                text: localWord.text,
-                isRead: isWordRead,
-              );
-            }).toList();
-
-            state = state.copyWith(
-              words: mergedWords,
-              realText: data['real_text']?.toString() ?? state.realText,
-              expected: data['expected']?.toString() ?? state.expected,
-              predicted: data['predicted']?.toString() ?? state.predicted,
-              accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
-            );
-            print("📈 [STATE UPDATE] Words highlighted status: ${state.words.map((w) => '${w.text}:${w.isRead}').toList()}");
-            
+            _handleServerPayload(data);
           } catch (parseError) {
             print("❌ [PARSER ERROR] Error interpreting JSON payload: $parseError");
           }
@@ -176,6 +168,108 @@ class RecitationNotifier extends Notifier<RecitationResult> {
     } catch (e) {
       print("❌ [CRITICAL FAILURE] Failed during startReciting initiation sequence: $e");
       state = state.copyWith(status: RecitationStatus.error);
+    }
+  }
+
+  void _handleServerPayload(Map<String, dynamic> data) {
+    final mode = data['mode']?.toString() ?? 'single';
+
+    if (mode == 'surah') {
+      // Fast "advance" message: pause detected, tell the user which ayah to read next
+      // immediately, without waiting for the inference result of the finished ayah.
+      final readNow = data['read_now'];
+      if (data['advance'] == true) {
+        final isFinished = data['finished'] == true;
+        state = state.copyWith(
+          status: isFinished ? RecitationStatus.success : RecitationStatus.recording,
+          nextAyah: readNow is num ? readNow.toInt() : state.nextAyah,
+        );
+        print("👁 [SURAH ADVANCE] read_now=${state.nextAyah} finished=$isFinished");
+        return;
+      }
+
+      // Sequential surah mode
+      final surahWords = state.surahWords;
+      final finalAyahId = (data['current_ayah'] as num?)?.toInt() ?? state.currentAyah;
+
+      // Update word highlights from the per-ayah word lists (order = ayah_order)
+      final wordsList = data['words'];
+      final ayahOrder = (data['ayah_order'] as List?)?.map((e) => (e as num).toInt()).toList();
+      final updated = <int, List<WordTrackResult>>{};
+      if (wordsList is List && ayahOrder != null) {
+        for (var i = 0; i < ayahOrder.length && i < wordsList.length; i++) {
+          final aId = ayahOrder[i];
+          final items = (wordsList[i] as List).map((item) {
+            if (item is Map) {
+              return WordTrackResult(
+                text: item['text']?.toString() ?? '',
+                isRead: item['is_read'] == true || item['isRead'] == true,
+              );
+            }
+            return WordTrackResult(text: item.toString(), isRead: false);
+          }).toList();
+          updated[aId] = items;
+        }
+      }
+      // Preserve any missing ayahs (in case order is incomplete)
+      for (final e in surahWords.entries) {
+        updated.putIfAbsent(e.key, () => e.value);
+      }
+
+      // Accuracies
+      final ayahAcc = <int, double>{};
+      final accData = data['ayah_accuracies'];
+      if (accData is Map) {
+        accData.forEach((k, v) {
+          if (v != null) ayahAcc[int.parse(k.toString())] = (v as num).toDouble();
+        });
+      }
+
+      final isFinished = data['finished'] == true;
+      final nextAyah = (data['next_ayah'] as num?)?.toInt() ?? 0;
+      state = state.copyWith(
+        status: isFinished ? RecitationStatus.success : RecitationStatus.recording,
+        words: [],
+        surahWords: updated,
+        ayahAccuracies: ayahAcc,
+        surahAverage: (data['surah_average'] as num?)?.toDouble() ?? state.surahAverage,
+        currentAyah: finalAyahId,
+        nextAyah: nextAyah,
+      );
+      print("📈 [SURAH STATE] avg=${state.surahAverage} current=${state.currentAyah}");
+    } else {
+      // Single ayah mode (original logic)
+      List<String> recognizedWords = [];
+      if (data.containsKey('words')) {
+        final words = data['words'];
+        if (words is List) {
+          for (var item in words) {
+            if (item is Map) {
+              if (item['is_read'] == true || item['isRead'] == true) {
+                recognizedWords.add(item['text']?.toString() ?? '');
+              }
+            } else if (item is String) {
+              recognizedWords.add(item);
+            }
+          }
+        }
+      }
+
+      final normalizedBackend = recognizedWords.map((w) => _normalizeArabic(w)).toList();
+
+      final mergedWords = state.words.map((localWord) {
+        final normalizedLocal = _normalizeArabic(localWord.text);
+        bool isWordRead = localWord.isRead || normalizedBackend.contains(normalizedLocal);
+        return WordTrackResult(text: localWord.text, isRead: isWordRead);
+      }).toList();
+
+      state = state.copyWith(
+        words: mergedWords,
+        realText: data['real_text']?.toString() ?? state.realText,
+        expected: data['expected']?.toString() ?? state.expected,
+        predicted: data['predicted']?.toString() ?? state.predicted,
+        accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
+      );
     }
   }
 

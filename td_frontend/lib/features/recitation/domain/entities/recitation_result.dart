@@ -1,6 +1,9 @@
 enum RecitationStatus { idle, recording, processing, success, retry, error }
 
+enum RecitationMode { singleAyah, surah }
+
 class RecitationResult {
+  // Single-ayah mode fields
   final List<WordTrackResult> words;
   final RecitationStatus status;
   final int selectedSurah;
@@ -9,6 +12,16 @@ class RecitationResult {
   final String expected;
   final String predicted;
   final double accuracy;
+
+  // Mode
+  final RecitationMode mode;
+
+  // Surah (sequential) mode fields
+  final Map<int, List<WordTrackResult>> surahWords;
+  final Map<int, double> ayahAccuracies;
+  final double surahAverage;
+  final int currentAyah;
+  final int nextAyah;
 
   RecitationResult({
     required this.words,
@@ -19,7 +32,14 @@ class RecitationResult {
     this.expected = "",
     this.predicted = "",
     this.accuracy = 0,
-  });
+    this.mode = RecitationMode.singleAyah,
+    Map<int, List<WordTrackResult>>? surahWords,
+    Map<int, double>? ayahAccuracies,
+    this.surahAverage = 0,
+    this.currentAyah = 0,
+    this.nextAyah = 0,
+  })  : surahWords = surahWords ?? {},
+        ayahAccuracies = ayahAccuracies ?? {};
 
   factory RecitationResult.initial() {
     return RecitationResult(
@@ -55,6 +75,12 @@ class RecitationResult {
     String? expected,
     String? predicted,
     double? accuracy,
+    RecitationMode? mode,
+    Map<int, List<WordTrackResult>>? surahWords,
+    Map<int, double>? ayahAccuracies,
+    double? surahAverage,
+    int? currentAyah,
+    int? nextAyah,
   }) {
     return RecitationResult(
       words: words ?? this.words,
@@ -65,6 +91,12 @@ class RecitationResult {
       expected: expected ?? this.expected,
       predicted: predicted ?? this.predicted,
       accuracy: accuracy ?? this.accuracy,
+      mode: mode ?? this.mode,
+      surahWords: surahWords ?? this.surahWords,
+      ayahAccuracies: ayahAccuracies ?? this.ayahAccuracies,
+      surahAverage: surahAverage ?? this.surahAverage,
+      currentAyah: currentAyah ?? this.currentAyah,
+      nextAyah: nextAyah ?? this.nextAyah,
     );
   }
 }
@@ -80,5 +112,9 @@ class WordTrackResult {
       text: json['text'],
       isRead: json['is_read'] ?? false,
     );
+  }
+
+  WordTrackResult copyWith({bool? isRead}) {
+    return WordTrackResult(text: text, isRead: isRead ?? this.isRead);
   }
 }

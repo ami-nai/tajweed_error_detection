@@ -8,7 +8,7 @@ class RecitationRepositoryImpl implements RecitationRepository {
   RecitationRepositoryImpl(this.remoteDataSource);
 
   @override
-  Future<Stream<dynamic>> startStreaming(int surahId, int ayahId) async {
+  Future<Stream<dynamic>> startStreaming(int surahId, int? ayahId) async {
     return await remoteDataSource.startStreamingRecording(surahId, ayahId);
   }
 

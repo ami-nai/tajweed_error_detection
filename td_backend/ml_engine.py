@@ -152,15 +152,9 @@ model.eval()
 extractor = AutoFeatureExtractor.from_pretrained("facebook/wav2vec2-base")
 
 
-def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
-    if (
-        surah_id not in TAJWEED_ONLY_INDEX
-        or ayah_id not in TAJWEED_ONLY_INDEX[surah_id]
-    ):
-        return []
-
-    word_data = TAJWEED_ONLY_INDEX[surah_id][ayah_id]["words"]
-
+def _predict_phonemes(audio_path: str) -> str:
+    """Load raw PCM audio and run model inference, returning the decoded
+    phoneme prediction string (shared by evaluate_audio and sequential mode)."""
     # 1. Load the raw bytes directly
     with open(audio_path, "rb") as f:
         audio_bytes = f.read()
@@ -205,6 +199,26 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
 
     pred_str = "".join(final_pred)
     print(f"🔮 [ML ENGINE] Cleaned AI Prediction String: '{pred_str}'")
+    return pred_str
+
+
+def DIACRITICS_STRIP():
+    return set('ًٌٍَُِّْٰٓۥۦۖۗۚۛۜ')
+
+
+def strip_diacritics(s):
+    return "".join(c for c in s if c not in DIACRITICS_STRIP())
+
+
+def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
+    if (
+        surah_id not in TAJWEED_ONLY_INDEX
+        or ayah_id not in TAJWEED_ONLY_INDEX[surah_id]
+    ):
+        return []
+
+    word_data = TAJWEED_ONLY_INDEX[surah_id][ayah_id]["words"]
+    pred_str = _predict_phonemes(audio_path)
 
     word_results = []
     expected_parts = []
@@ -229,13 +243,6 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         clean_text = "".join([c for c in raw_text if c not in diacritics])
         # Only keep letters your model's vocabulary actually supports
         return "".join([c for c in clean_text if c in TRAINED_PHONEMES])
-
-    # Diacritics and Madd markers to strip for consonant-only matching
-    # (model may not predict these for unseen verses)
-    DIACRITICS = set('ًٌٍَُِّْٰٓۥۦۖۗۚۛۜ')
-
-    def strip_diacritics(s):
-        return "".join(c for c in s if c not in DIACRITICS)
 
     # 7. Check which words match the speech detected
     pred_stripped = strip_diacritics(pred_str)
@@ -301,3 +308,19 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         "predicted": pred_str,
         "accuracy": round(accuracy, 2),
     }
+
+
+def get_surah_ayah_ids(surah_id: int) -> list[int]:
+    """Return sorted ayah ids present in the index for a surah (sequential order)."""
+    if surah_id not in TAJWEED_ONLY_INDEX:
+        return []
+    return sorted(TAJWEED_ONLY_INDEX[surah_id].keys())
+
+
+def get_surah_words(surah_id: int) -> list[list[dict]]:
+    """Return a list (one per ayah, in order) of {'text', 'phonemes'} word dicts."""
+    ayahs = get_surah_ayah_ids(surah_id)
+    result = []
+    for a_id in ayahs:
+        result.append(TAJWEED_ONLY_INDEX[surah_id][a_id]["words"])
+    return result
