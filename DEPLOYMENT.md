@@ -10,10 +10,19 @@ Android app (Flutter)  --wss://-->  FastAPI backend (uvicorn)
 
 The backend runs the heavy ML model (torch + 361MB `.pt`), so it cannot run on a
 phone. We host it for free on **Google Colab** and expose it with a free
-**cloudflared tunnel** to get a public `wss://` URL. Teammates just install a
+**ngrok tunnel** to get a public `wss://` URL. Teammates just install a
 release APK that points at that URL.
 
-## 1. Host the backend on Colab (one-time, by you)
+## 0. Set up ngrok once (no credit card)
+
+1. Sign up free at https://ngrok.com (email only).
+2. Copy your **auth token** from the ngrok dashboard (looks like `2abcDEFghI...`).
+3. In Colab, open the left sidebar, click the **key icon (Secrets)**, add:
+   - Name: `NGROK_AUTHTOKEN`
+   - Value: `<your token>`
+   - Toggle "Notebook access" on.
+
+## 1. Host the backend on Colab (by you)
 
 1. Create a new Colab notebook (https://colab.research.google.com).
 2. Runtime menu → *Change runtime type* → **CPU** (free). No GPU needed.
@@ -31,14 +40,13 @@ release APK that points at that URL.
    drive.mount('/content/drive')
    ```
 5. Run the deploy script (clones the repo, installs CPU deps, starts the
-   backend, starts the tunnel):
+   backend, starts the ngrok tunnel):
    ```python
-   !pip install -q pyngrok 2>/dev/null || true   # optional convenience
    !wget -q https://raw.githubusercontent.com/ami-nai/tajweed_error_detection/realtime/td_backend/deploy_colab.py -O deploy_colab.py
    %run deploy_colab.py --models "/content/drive/MyDrive/tajweed_models"
    ```
 6. Wait 2-4 minutes (model load). At the end the cell prints a
-   **PUBLIC BACKEND URL** like `wss://something.trycloudflare.com`.
+   **PUBLIC BACKEND URL** like `wss://something.ngrok-free.app`.
 7. Keep this tab open while teammates use the app.
 
 ## 2. Build the APK pointing at that URL (by you)

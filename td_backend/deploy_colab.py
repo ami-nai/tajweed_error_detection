@@ -1,22 +1,26 @@
 """
 Deploy the tajweed backend on a free Google Colab session and expose it via a
-free cloudflared tunnel so that a Flutter release APK on any device can reach it.
+free ngrok tunnel so that a Flutter release APK on any device can reach it.
+
+SETUP (do this once, ~2 min, no credit card):
+  1. Create a free ngrok account at https://ngrok.com (email only).
+  2. Copy your auth token from the ngrok dashboard (it looks like
+     "2abcDEFghI...").
+  3. In Colab add it as a secret (key icon in the left sidebar):
+       Secret name:  NGROK_AUTHTOKEN
+       Value:        <paste your token>
 
 HOW TO USE (in a Colab notebook cell):
-  1. Upload/sync model assets so the script can find them. Two options:
-       A) Put them in your Google Drive, e.g.
-            /content/drive/MyDrive/tajweed_models/
-                quran_model_final-alif-hamja_correction.pt
-                silero_vad.jit
-       B) Point the cell at a public/private URL via cloud storage.
-  2. Clone this repo (or upload td_backend) into /content.
+  1. Put the model files in Google Drive, e.g.
+       /content/drive/MyDrive/tajweed_models/
+           quran_model_final-alif-hamja_correction.pt
+           silero_vad.jit
+  2. Mount Drive:
+       from google.colab import drive; drive.mount('/content/drive')
   3. Run this script:
-       !pip install -q cloudflared  # or the cloudflared binary below
-       %run deploy_colab.py \
-           --repo "https://github.com/ami-nai/tajweed_error_detection.git" \
-           --models "/content/drive/MyDrive/tajweed_models" \
-           --port 8000
-  4. Copy the wss:// URL printed at the end. Build the APK with:
+       !wget -q https://raw.githubusercontent.com/ami-nai/tajweed_error_detection/realtime/td_backend/deploy_colab.py -O deploy_colab.py
+       %run deploy_colab.py --models "/content/drive/MyDrive/tajweed_models"
+  4. The notebook prints a clean PUBLIC URL. Build the APK locally with:
        flutter build apk --release --dart-define=BACKEND_URL=<wss-url>
 
 NOTES / CAVEATS
@@ -48,19 +52,6 @@ def run(cmd, check=True):
     if r.returncode != 0 and check:
         sys.exit(r.returncode)
     return r
-
-
-def install_cloudflared():
-    """Install the cloudflared binary (works on both CPU & any Colab container)."""
-    print("Installing cloudflared...", flush=True)
-    if shutil.which("cloudflared"):
-        return
-    cmd = (
-        "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/"
-        "cloudflared-linux-amd64 -O /usr/local/bin/cloudflared && "
-        "chmod +x /usr/local/bin/cloudflared"
-    )
-    run(cmd)
 
 
 def prepare(models_dir):
@@ -110,34 +101,49 @@ def serve(port):
 
 
 def tunnel(port):
-    print("== Starting cloudflared tunnel (free wss:// URL) ==", flush=True)
-    cmd = (
-        "nohup cloudflared tunnel --url http://localhost:%d "
-        "--no-autoupdate > tunnel.log 2>&1 &" % port
-    )
-    run(cmd)
-    url = None
-    for _ in range(120):
-        time.sleep(2)
-        if os.path.isfile("tunnel.log"):
-            text = open("tunnel.log").read()
-            if "trycloudflare.com" in text:
-                url = text.split("https://")[1].split(".trycloudflare.com")[0]
-                url = f"wss://{url}.trycloudflare.com"
-                break
-            if "ERR" in text and "error" in text.lower():
-                print("Tunnel error:", text[-500:], flush=True)
-                break
-    if url:
-        print("\n" + "=" * 70, flush=True)
-        print("PUBLIC BACKEND URL:", flush=True)
-        print(f"  wss://{url[6:]}/ws/recite", flush=True)
-        print("Use for flutter build:", flush=True)
-        print(f"  --dart-define=BACKEND_URL={url}", flush=True)
-        print("=" * 70, flush=True)
-    else:
-        print("Could not read tunnel URL. Inspect tunnel.log:", flush=True)
-        run("cat tunnel.log", check=False)
+    print("== Starting ngrok tunnel (free wss:// URL) ==", flush=True)
+
+    token = os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("NGROK_TOKEN")
+    if not token:
+        print(
+            "\nERROR: NGROK_AUTHTOKEN secret is not set.\n"
+            "  1. Sign up free at https://ngrok.com (no credit card).\n"
+            "  2. Copy your auth token from the dashboard.\n"
+            "  3. In Colab: left sidebar -> key icon (Secrets) ->\n"
+            "     name `NGROK_AUTHTOKEN`, paste the token, enable\n"
+            "     'Notebook access'.\n"
+            "  4. Re-run this cell.",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+
+    ngrok = None
+    try:
+        from pyngrok import ngrok as _ngrok
+        ngrok = _ngrok
+    except Exception:
+        run("pip install -q pyngrok")
+        from pyngrok import ngrok as _ngrok
+        ngrok = _ngrok
+
+    ngrok.set_auth_token(token)
+    tunnel_obj = ngrok.connect(port, bind_tls=True)
+    url = tunnel_obj.public_url  # e.g. https://<host>.ngrok-free.app
+
+    if not url:
+        print("Could not read ngrok URL.", flush=True)
+        ngrok.get_tunnels()
+        sys.exit(1)
+
+    host = url.replace("https://", "", 1)
+    ws_url = f"wss://{host}"
+    print("\n" + "=" * 70, flush=True)
+    print("PUBLIC BACKEND URL:", flush=True)
+    print(f"  {ws_url}/ws/recite", flush=True)
+    print("Use for flutter build (on your machine):", flush=True)
+    print(f"  flutter build apk --release --dart-define=BACKEND_URL={ws_url}", flush=True)
+    print("=" * 70, flush=True)
 
 
 def main():
@@ -148,7 +154,7 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
-    install_cloudflared()
+    run("pip install -q pyngrok")
     prepare(args.models)
     serve(args.port)
     tunnel(args.port)
