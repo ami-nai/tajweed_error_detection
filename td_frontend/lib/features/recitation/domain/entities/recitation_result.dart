@@ -46,7 +46,7 @@ class RecitationResult {
   final String expected;
   final String predicted;
   final double accuracy;
-  final double wer;
+  final double per;
 
   // Mode
   final RecitationMode mode;
@@ -57,11 +57,20 @@ class RecitationResult {
   final double surahAverage;
   final int currentAyah;
   final int nextAyah;
-  final Map<int, double> ayahWER;
-  final double surahWER;
+  final Map<int, double> ayahPER;
+  final double surahPER;
 
   // For the colored transcription diff (expected vs predicted)
   final List<DiffHit> diff;
+
+  // Plain-text mistake feedback
+  final List<String> mistakes;
+  final Map<int, List<String>> ayahMistakes;
+
+  // Per-ayah transcriptions (surah mode): diff + raw expected/predicted strings
+  final Map<int, List<DiffHit>> ayahDiffs;
+  final Map<int, String> ayahExpected;
+  final Map<int, String> ayahPredicted;
 
   RecitationResult({
     required this.words,
@@ -72,20 +81,30 @@ class RecitationResult {
     this.expected = "",
     this.predicted = "",
     this.accuracy = 0,
-    this.wer = 0,
+    this.per = 0,
     this.mode = RecitationMode.singleAyah,
     Map<int, List<WordTrackResult>>? surahWords,
     Map<int, double>? ayahAccuracies,
     this.surahAverage = 0,
     this.currentAyah = 0,
     this.nextAyah = 0,
-    Map<int, double>? ayahWER,
-    this.surahWER = 0,
+    Map<int, double>? ayahPER,
+    this.surahPER = 0,
     List<DiffHit>? diff,
+    List<String>? mistakes,
+    Map<int, List<String>>? ayahMistakes,
+    Map<int, List<DiffHit>>? ayahDiffs,
+    Map<int, String>? ayahExpected,
+    Map<int, String>? ayahPredicted,
   })  : surahWords = surahWords ?? {},
         ayahAccuracies = ayahAccuracies ?? {},
-        ayahWER = ayahWER ?? {},
-        diff = diff ?? [];
+        ayahPER = ayahPER ?? {},
+        diff = diff ?? [],
+        mistakes = mistakes ?? [],
+        ayahMistakes = ayahMistakes ?? {},
+        ayahDiffs = ayahDiffs ?? {},
+        ayahExpected = ayahExpected ?? {},
+        ayahPredicted = ayahPredicted ?? {};
 
   factory RecitationResult.initial() {
     return RecitationResult(
@@ -109,7 +128,7 @@ class RecitationResult {
       expected: json['expected']?.toString() ?? '',
       predicted: json['predicted']?.toString() ?? '',
       accuracy: (json['accuracy'] as num?)?.toDouble() ?? 0,
-      wer: (json['wer'] as num?)?.toDouble() ?? 0,
+      per: (json['per'] as num?)?.toDouble() ?? 0,
     );
   }
 
@@ -122,16 +141,21 @@ class RecitationResult {
     String? expected,
     String? predicted,
     double? accuracy,
-    double? wer,
+    double? per,
     RecitationMode? mode,
     Map<int, List<WordTrackResult>>? surahWords,
     Map<int, double>? ayahAccuracies,
     double? surahAverage,
     int? currentAyah,
     int? nextAyah,
-    Map<int, double>? ayahWER,
-    double? surahWER,
+    Map<int, double>? ayahPER,
+    double? surahPER,
     List<DiffHit>? diff,
+    List<String>? mistakes,
+    Map<int, List<String>>? ayahMistakes,
+    Map<int, List<DiffHit>>? ayahDiffs,
+    Map<int, String>? ayahExpected,
+    Map<int, String>? ayahPredicted,
   }) {
     return RecitationResult(
       words: words ?? this.words,
@@ -142,16 +166,21 @@ class RecitationResult {
       expected: expected ?? this.expected,
       predicted: predicted ?? this.predicted,
       accuracy: accuracy ?? this.accuracy,
-      wer: wer ?? this.wer,
+      per: per ?? this.per,
       mode: mode ?? this.mode,
       surahWords: surahWords ?? this.surahWords,
       ayahAccuracies: ayahAccuracies ?? this.ayahAccuracies,
       surahAverage: surahAverage ?? this.surahAverage,
       currentAyah: currentAyah ?? this.currentAyah,
       nextAyah: nextAyah ?? this.nextAyah,
-      ayahWER: ayahWER ?? this.ayahWER,
-      surahWER: surahWER ?? this.surahWER,
+      ayahPER: ayahPER ?? this.ayahPER,
+      surahPER: surahPER ?? this.surahPER,
       diff: diff ?? this.diff,
+      mistakes: mistakes ?? this.mistakes,
+      ayahMistakes: ayahMistakes ?? this.ayahMistakes,
+      ayahDiffs: ayahDiffs ?? this.ayahDiffs,
+      ayahExpected: ayahExpected ?? this.ayahExpected,
+      ayahPredicted: ayahPredicted ?? this.ayahPredicted,
     );
   }
 }

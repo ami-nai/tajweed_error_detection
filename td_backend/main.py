@@ -65,7 +65,7 @@ async def websocket_stream(websocket: WebSocket):
                 for a_id in session_ayahs
             }
             ayah_accuracies = {a_id: None for a_id in session_ayahs}
-            ayah_wers = {a_id: None for a_id in session_ayahs}
+            ayah_pers = {a_id: None for a_id in session_ayahs}
             # Index into session_ayahs for sequential advancement
             ayah_index = 0
             print(f"→ Surah mode: {len(session_ayahs)} ayahs loaded for surah {surah_id}.")
@@ -137,7 +137,7 @@ async def websocket_stream(websocket: WebSocket):
                         # Evaluate the just-finished ayah and update its words/accuracy.
                         await _handle_surah_pause(
                             websocket, surah_id, session_read, ayah_accuracies,
-                            session_ayahs, ayah_index, tmp_path,
+                            session_ayahs, ayah_pers, ayah_index, tmp_path,
                         )
                         ayah_index += 1  # advance to next ayah
 
@@ -185,14 +185,15 @@ async def _handle_single_pause(websocket, surah_id, ayah_id, session_words, tmp_
             "expected": chunk_result.get("expected", ""),
             "predicted": chunk_result.get("predicted", ""),
             "accuracy": chunk_result.get("accuracy", 0.0),
-            "wer": chunk_result.get("wer", 0.0),
+            "per": chunk_result.get("per", 0.0),
             "diff": chunk_result.get("diff", []),
+            "mistakes": chunk_result.get("mistakes", []),
         }
     )
 
 
 async def _handle_surah_pause(websocket, surah_id, session_read, ayah_accuracies,
-                        session_ayahs, ayah_index, tmp_path):
+                        session_ayahs, ayah_pers, ayah_index, tmp_path):
     """Process a pause-delimited chunk for surah (sequential) mode.
 
     The chunk is attributed to the next expected ayah (session_ayahs[ayah_index]).
@@ -213,13 +214,13 @@ async def _handle_surah_pause(websocket, surah_id, session_read, ayah_accuracies
                 ayah_words[i]["letters"] = word["letters"]
 
     ayah_accuracies[target_ayah] = chunk_result.get("accuracy", 0.0)
-    ayah_wers[target_ayah] = chunk_result.get("wer", 0.0)
+    ayah_pers[target_ayah] = chunk_result.get("per", 0.0)
 
     # Running surah average over recognized ayahs only
     scored = [acc for acc in ayah_accuracies.values() if acc is not None]
     surah_average = round(sum(scored) / len(scored), 2) if scored else 0.0
-    scored_wer = [w for w in ayah_wers.values() if w is not None]
-    surah_wer = round(sum(scored_wer) / len(scored_wer), 2) if scored_wer else 0.0
+    scored_per = [p for p in ayah_pers.values() if p is not None]
+    surah_per = round(sum(scored_per) / len(scored_per), 2) if scored_per else 0.0
 
     # Flatten words into a list of ayah word-lists in order for the client
     words_by_ayah = [
@@ -236,9 +237,12 @@ async def _handle_surah_pause(websocket, surah_id, session_read, ayah_accuracies
             "words": words_by_ayah,
             "ayah_accuracies": ayah_accuracies,
             "surah_average": surah_average,
-            "ayah_wers": ayah_wers,
-            "surah_wer": surah_wer,
+            "ayah_pers": ayah_pers,
+            "surah_per": surah_per,
             "diff": chunk_result.get("diff", []),
+            "expected": chunk_result.get("expected", ""),
+            "predicted": chunk_result.get("predicted", ""),
+            "mistakes": chunk_result.get("mistakes", []),
             "finished": False,
         }
     )

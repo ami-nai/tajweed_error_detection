@@ -270,6 +270,18 @@ def _is_diacritic(ch):
     return unicodedata.category(ch).startswith("M")
 
 
+def _is_feedback_char(ch):
+    """True if a character in the reference can actually be verified by the model.
+
+    Only tokens in the trained vocabulary (consonants + emittable harakat like
+    َ ِ ُ ۦ ۥ) are reportable. Marks the model can never output (sukun, shadda,
+    tanween, maddah, superscript alif, waqf marks) and consonants outside the
+    vocab (e.g. ظ ض ز) are excluded so we never accuse the user of untestable
+    mistakes.
+    """
+    return ch in TRAINED_PHONEMES
+
+
 def _assign_letters(display_text, consonant_statuses):
     """Build the per-character {ch, status} list for a displayed word.
 
@@ -291,26 +303,74 @@ def _assign_letters(display_text, consonant_statuses):
     return letters
 
 
-def _compute_wer(ref_words, hyp_words):
-    """Standard word error rate (%) via Levenshtein over word lists."""
-    if not ref_words:
-        return 0.0
-    n, m = len(ref_words), len(hyp_words)
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(1, n + 1):
-        dp[i][0] = i
-    for j in range(1, m + 1):
-        dp[0][j] = j
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = 0 if ref_words[i - 1] == hyp_words[j - 1] else 1
-            dp[i][j] = min(
-                dp[i - 1][j - 1] + cost,
-                dp[i - 1][j] + 1,
-                dp[i][j - 1] + 1,
-            )
-    dist = dp[n][m]
-    return round(min(dist / n * 100, 100.0), 2)
+def _build_mistakes(word_results, word_data, expected_str, diff, max_msgs=6):
+    """Convert the full-ayah diff into plain-text mistake messages.
+
+    Only emittable reference characters (_is_feedback_char) are reported, so
+    the model never fabricates errors on marks it cannot output (sukun, shadda,
+    tanween, etc.). Whole words that weren't read produce a single summary line
+    and suppress noisy per-character messages.
+    """
+    if not diff or not expected_str or len(word_data) == 0:
+        return []
+
+    # Try to map diff characters to expected words via the full stream spacing.
+    # Without word mapping we cannot name the ayah word, so skip char feedback.
+    expected_words = expected_str.split()
+    word_map_ok = len(expected_words) == len(word_data)
+    if not word_map_ok:
+        return []
+
+    # Track words that were not recognized at all.
+    missed = {i for i, res in enumerate(word_results) if not res["is_read"]}
+
+    mistakes = []
+    word_idx = 0
+    for pair in diff:
+        if len(mistakes) >= max_msgs:
+            break
+        e, h = pair.get("e"), pair.get("h")
+        status = pair.get("status")
+
+        if e is not None and e == " ":
+            word_idx += 1
+            continue
+
+        if word_idx >= len(word_data):
+            break
+
+        if word_idx in missed:
+            continue  # whole-word message already covers this ayah word
+
+        if e is not None and not _is_feedback_char(e):
+            continue  # unverifiable reference char (sukun, shadda, tanween, ...)
+
+        word_label = word_data[word_idx]["text"]
+
+        if status == "S" and e is not None and h is not None and h != " ":
+            msg = f'In "\u00ab{word_label}\u00bb", you said "\u00ab{h}\u00bb" instead of "\u00ab{e}\u00bb".'
+            mistakes.append(msg)
+        elif status == "D" and e is not None:
+            if e in DIACRITICS_STRIP():
+                msg = f'In "\u00ab{word_label}\u00bb", you missed the harakah "\u00ab{e}\u00bb".'
+            else:
+                msg = f'In "\u00ab{word_label}\u00bb", you skipped the letter "\u00ab{e}\u00bb".'
+            mistakes.append(msg)
+        elif status == "I" and h is not None and h != " ":
+            msg = f'You said an extra "\u00ab{h}\u00bb" in "\u00ab{word_label}\u00bb".'
+            mistakes.append(msg)
+
+    # Whole-word misses.
+    for i, res in enumerate(word_results):
+        if res["is_read"]:
+            continue
+        mistakes.append(
+            f'You didn\'t recite the word "\u00ab{res["text"]}\u00bb" correctly.'
+        )
+        if len(mistakes) >= max_msgs:
+            break
+
+    return mistakes
 
 
 def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
@@ -325,7 +385,6 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
 
     word_results = []
     expected_parts = []
-    ref_words = []
 
     # Helper function to extract valid matching letters from raw text if phonetizer fails
     def get_fallback_target(raw_text):
@@ -375,7 +434,6 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         expected_parts.append(target_str)
 
         target_stripped = strip_diacritics(target_str)
-        ref_words.append(target_stripped)
 
         win_len = len(target_stripped)
         has_been_read = False
@@ -431,9 +489,8 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
     dist = Levenshtein.distance(pred_str, expected_str) if expected_str else 0
     accuracy = max(0, 100 - (dist / len(expected_str) * 100)) if expected_str else 0.0
 
-    # Word Error Rate: compare expected words vs predicted words (space delimited).
-    hyp_words = strip_diacritics(pred_str).split() if pred_str.strip() else []
-    wer = _compute_wer(ref_words, hyp_words)
+    # Phoneme Error Rate: edit distance over the full phoneme stream (harakat included)
+    per = round(dist / len(expected_str) * 100, 2) if expected_str else 0.0
 
     # Full-ayah alignment diff for the colored transcription lines.
     diff = []
@@ -448,14 +505,18 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
             status = "S"
         diff.append({"e": e, "h": h, "status": status})
 
+    # Plain-text mistake feedback (excludes model-unverifiable reference chars).
+    mistakes = _build_mistakes(word_results, word_data, expected_str, diff)
+
     return {
         "words": word_results,
         "real_text": real_text,
         "expected": expected_str,
         "predicted": pred_str,
         "accuracy": round(accuracy, 2),
-        "wer": wer,
+        "per": per,
         "diff": diff,
+        "mistakes": mistakes,
     }
 
 

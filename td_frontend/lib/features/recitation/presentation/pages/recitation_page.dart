@@ -108,7 +108,48 @@ class RecitationPage extends ConsumerWidget {
                 ),
               ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
+
+            // Start / Stop control buttons (below surah/ayah selection)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.teal,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  icon: const Icon(Icons.mic, color: Colors.white, size: 18),
+                  label: Text(
+                    isSurahMode ? 'Start Surah' : 'Start',
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                  onPressed: recitationState.status == RecitationStatus.recording
+                      ? null
+                      : () => notifier.startReciting(
+                            surahId: recitationState.selectedSurah,
+                            ayahId: isSurahMode ? null : recitationState.selectedAyah,
+                          ),
+                ),
+                const SizedBox(width: 12),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  icon: const Icon(Icons.stop, color: Colors.white, size: 18),
+                  label: const Text('Stop', style: TextStyle(color: Colors.white, fontSize: 14)),
+                  onPressed: recitationState.status != RecitationStatus.recording
+                      ? null
+                      : () => notifier.stopReciting(),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
 
             // 2. The Quran Text Card
             Card(
@@ -151,9 +192,9 @@ class RecitationPage extends ConsumerWidget {
                         ),
                       ),
                       const SizedBox(height: 6),
-                      if (recitationState.surahWER > 0) ...[
+                      if (recitationState.surahPER > 0) ...[
                         Text(
-                          'Surah WER: ${recitationState.surahWER.toStringAsFixed(1)}%',
+                          'Surah PER: ${recitationState.surahPER.toStringAsFixed(1)}%',
                           style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.black54),
                         ),
                         const SizedBox(height: 6),
@@ -176,24 +217,30 @@ class RecitationPage extends ConsumerWidget {
                                   : Colors.redAccent,
                         ),
                       ),
-                      if (recitationState.wer > 0) ...[
+                      if (recitationState.per > 0) ...[
                         const SizedBox(height: 6),
                         Text(
-                          'WER: ${recitationState.wer.toStringAsFixed(1)}%',
+                          'PER: ${recitationState.per.toStringAsFixed(1)}%',
                           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black54),
                         ),
                       ],
                     ],
                     const SizedBox(height: 12),
-                    Text('Real Transcription:',
-                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
-                    const SizedBox(height: 4),
-                    _buildDiffText(recitationState.diff, showExpected: true, empty: recitationState.expected),
-                    const SizedBox(height: 12),
-                    Text('Predicted Transcription:',
-                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
-                    const SizedBox(height: 4),
-                    _buildDiffText(recitationState.diff, showExpected: false, empty: recitationState.predicted),
+                    if (!isSurahMode) ...[
+                      Text('Real Transcription:',
+                          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
+                      const SizedBox(height: 4),
+                      _buildDiffText(recitationState.diff, showExpected: true, empty: recitationState.expected),
+                      const SizedBox(height: 12),
+                      Text('Predicted Transcription:',
+                          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
+                      const SizedBox(height: 4),
+                      _buildDiffText(recitationState.diff, showExpected: false, empty: recitationState.predicted),
+                      if (recitationState.mistakes.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        _ExpandableMistakes(mistakes: recitationState.mistakes),
+                      ],
+                    ],
                   ],
                 ),
               ),
@@ -229,42 +276,6 @@ class RecitationPage extends ConsumerWidget {
               ),
 
             const SizedBox(height: 20),
-
-            // 4. Control Buttons
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.teal,
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                  ),
-                  icon: const Icon(Icons.mic, color: Colors.white),
-                  label: Text(
-                    isSurahMode ? 'Start Surah' : 'Start',
-                    style: const TextStyle(color: Colors.white, fontSize: 18),
-                  ),
-                  onPressed: recitationState.status == RecitationStatus.recording
-                      ? null
-                      : () => notifier.startReciting(
-                            surahId: recitationState.selectedSurah,
-                            ayahId: isSurahMode ? null : recitationState.selectedAyah,
-                          ),
-                ),
-                const SizedBox(width: 20),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.redAccent,
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                  ),
-                  icon: const Icon(Icons.stop, color: Colors.white),
-                  label: const Text('Stop', style: TextStyle(color: Colors.white, fontSize: 18)),
-                  onPressed: recitationState.status != RecitationStatus.recording
-                      ? null
-                      : () => notifier.stopReciting(),
-                ),
-              ],
-            ),
           ],
         ),
       ),
@@ -296,7 +307,7 @@ class RecitationPage extends ConsumerWidget {
           text: TextSpan(
             text: word.text,
             style: TextStyle(
-              fontSize: 32,
+              fontSize: 24,
               fontWeight: FontWeight.w600,
               fontFamily: 'Amiri',
               color: word.isRead ? teal : Colors.black87,
@@ -323,7 +334,7 @@ class RecitationPage extends ConsumerWidget {
               return TextSpan(
                 text: letter.ch,
                 style: TextStyle(
-                  fontSize: 32,
+                  fontSize: 24,
                   fontWeight: FontWeight.w600,
                   fontFamily: 'Amiri',
                   color: color,
@@ -414,7 +425,7 @@ class RecitationPage extends ConsumerWidget {
           final words = state.surahWords[aId] ?? [];
           final isCurrent = aId == readNow;
           final ayahAcc = state.ayahAccuracies[aId];
-          final ayahWer = state.ayahWER[aId];
+          final ayahPer = state.ayahPER[aId];
           return Container(
             margin: const EdgeInsets.symmetric(vertical: 6.0),
             padding: const EdgeInsets.all(10),
@@ -433,45 +444,50 @@ class RecitationPage extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  // Ayah label + (optional) per-ayah accuracy + WER + "read now" flag
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      if (ayahWer != null && ayahWer > 0)
+                  // Ayah label + (optional) per-ayah accuracy + PER + "read now" flag
+                  Directionality(
+                    textDirection: TextDirection.ltr,
+                    child: Row(
+                      children: [
                         Text(
-                          'WER ${ayahWer.toStringAsFixed(0)}%',
-                          style: const TextStyle(
-                              fontSize: 13, color: Colors.redAccent, fontWeight: FontWeight.w600),
-                        ),
-                      if (ayahAcc != null)
-                        Text(
-                          ' ${ayahAcc.toStringAsFixed(0)}%',
-                          style: const TextStyle(
-                              fontSize: 13, color: Colors.black45, fontWeight: FontWeight.w600),
-                        ),
-                      Text(
-                        'Ayah $aId',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
-                          color: isCurrent ? Colors.teal : Colors.black54,
-                        ),
-                      ),
-                      if (isCurrent) ...[
-                        const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: Colors.teal,
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: const Text(
-                            '▶ Read now',
-                            style: TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.bold),
+                          'Ayah $aId',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: isCurrent ? Colors.teal : Colors.black54,
                           ),
                         ),
+                        const Spacer(),
+                        if (isCurrent) ...[
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: Colors.teal,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Text(
+                              '▶ Read now',
+                              style: TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        if (ayahAcc != null) ...[
+                          Text(
+                            'Acc ${ayahAcc.toStringAsFixed(0)}%',
+                            style: const TextStyle(
+                                fontSize: 11, color: Colors.black45, fontWeight: FontWeight.w600),
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        if (ayahPer != null && ayahPer > 0)
+                          Text(
+                            'PER ${ayahPer.toStringAsFixed(0)}%',
+                            style: const TextStyle(
+                                fontSize: 11, color: Colors.redAccent, fontWeight: FontWeight.w600),
+                          ),
                       ],
-                    ],
+                    ),
                   ),
                   const SizedBox(height: 2),
                   Wrap(
@@ -480,12 +496,156 @@ class RecitationPage extends ConsumerWidget {
                     alignment: WrapAlignment.end,
                     children: words.map((word) => _wordChild(word)).toList(),
                   ),
+                  if (state.ayahDiffs.containsKey(aId)) ...[
+                    const SizedBox(height: 4),
+                    _ExpandableTranscription(
+                      diff: state.ayahDiffs[aId] ?? const [],
+                      builder: (diff, showExpected) => _buildDiffText(
+                        diff,
+                        showExpected: showExpected,
+                        empty: showExpected
+                            ? (state.ayahExpected[aId] ?? '')
+                            : (state.ayahPredicted[aId] ?? ''),
+                      ),
+                    ),
+                  ],
+                  if ((state.ayahMistakes[aId] ?? const []).isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    _ExpandableMistakes(mistakes: state.ayahMistakes[aId] ?? const []),
+                  ],
                 ],
               ),
             ),
           );
         }),
       ],
+    );
+  }
+}
+
+class _ExpandableTranscription extends StatefulWidget {
+  final List<DiffHit> diff;
+  final Widget Function(List<DiffHit> diff, bool showExpected) builder;
+
+  const _ExpandableTranscription({required this.diff, required this.builder});
+
+  @override
+  State<_ExpandableTranscription> createState() => _ExpandableTranscriptionState();
+}
+
+class _ExpandableTranscriptionState extends State<_ExpandableTranscription> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _expanded ? 'Hide transcription' : 'Show transcription',
+                    style: const TextStyle(fontSize: 12, color: Colors.black45),
+                  ),
+                  Icon(
+                    _expanded ? Icons.arrow_drop_up : Icons.arrow_drop_down,
+                    color: Colors.black45,
+                    size: 22,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded) ...[
+            const Divider(height: 8),
+            const Text('Real Transcription:',
+                style: TextStyle(fontWeight: FontWeight.w600, color: Colors.black54)),
+            const SizedBox(height: 2),
+            widget.builder(widget.diff, true),
+            const SizedBox(height: 8),
+            const Text('Predicted Transcription:',
+                style: TextStyle(fontWeight: FontWeight.w600, color: Colors.black54)),
+            const SizedBox(height: 2),
+            widget.builder(widget.diff, false),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ExpandableMistakes extends StatefulWidget {
+  final List<String> mistakes;
+  const _ExpandableMistakes({required this.mistakes});
+
+  @override
+  State<_ExpandableMistakes> createState() => _ExpandableMistakesState();
+}
+
+class _ExpandableMistakesState extends State<_ExpandableMistakes> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline, color: Colors.redAccent, size: 16),
+                  const SizedBox(width: 4),
+                  Text(
+                    _expanded ? 'Hide mistakes' : 'Show mistakes',
+                    style: const TextStyle(fontSize: 12, color: Colors.redAccent),
+                  ),
+                  Icon(
+                    _expanded ? Icons.arrow_drop_up : Icons.arrow_drop_down,
+                    color: Colors.redAccent,
+                    size: 22,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded) ...[
+            const Divider(height: 8),
+            for (final msg in widget.mistakes)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('• ', style: TextStyle(color: Colors.redAccent, fontSize: 14)),
+                    Expanded(
+                      child: Text(
+                        msg,
+                        textDirection: TextDirection.ltr,
+                        style: const TextStyle(fontSize: 13, color: Colors.black87, height: 1.3),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ],
+      ),
     );
   }
 }

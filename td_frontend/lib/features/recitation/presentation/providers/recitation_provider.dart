@@ -140,8 +140,8 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       currentAyah: 0,
       nextAyah: 0,
       words: [],
-      ayahWER: {},
-      surahWER: 0,
+      ayahPER: {},
+      surahPER: 0,
       diff: [],
     );
   }
@@ -243,8 +243,8 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         updated.putIfAbsent(e.key, () => e.value);
       }
 
-      // Accuracies
-      final ayahAcc = <int, double>{};
+      // Accuracies (seed from existing so a bare 'finished' message doesn't wipe them)
+      final ayahAcc = <int, double>{...state.ayahAccuracies};
       final accData = data['ayah_accuracies'];
       if (accData is Map) {
         accData.forEach((k, v) {
@@ -252,17 +252,33 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         });
       }
 
-      // WER per ayah
-      final ayahWER = <int, double>{};
-      final werData = data['ayah_wers'];
-      if (werData is Map) {
-        werData.forEach((k, v) {
-          if (v != null) ayahWER[int.parse(k.toString())] = (v as num).toDouble();
+      // PER per ayah
+      final ayahPER = <int, double>{...state.ayahPER};
+      final perData = data['ayah_pers'];
+      if (perData is Map) {
+        perData.forEach((k, v) {
+          if (v != null) ayahPER[int.parse(k.toString())] = (v as num).toDouble();
         });
       }
 
       final isFinished = data['finished'] == true;
       final nextAyah = (data['next_ayah'] as num?)?.toInt() ?? 0;
+      // Per-ayah transcriptions (only update when the message carries them).
+      final ayahDiffs = Map<int, List<DiffHit>>.from(state.ayahDiffs);
+      final ayahExpected = Map<int, String>.from(state.ayahExpected);
+      final ayahPredicted = Map<int, String>.from(state.ayahPredicted);
+      final ayahMistakes = Map<int, List<String>>.from(state.ayahMistakes);
+      final hasTranscript = data.containsKey('expected') && data.containsKey('predicted');
+      if (hasTranscript) {
+        final diffList = _parseDiff(data['diff']);
+        ayahDiffs[finalAyahId] = diffList;
+        ayahExpected[finalAyahId] = data['expected']?.toString() ?? '';
+        ayahPredicted[finalAyahId] = data['predicted']?.toString() ?? '';
+        if (data['mistakes'] is List) {
+          ayahMistakes[finalAyahId] =
+              (data['mistakes'] as List).map((e) => e.toString()).toList();
+        }
+      }
       state = state.copyWith(
         status: isFinished ? RecitationStatus.success : RecitationStatus.recording,
         words: [],
@@ -271,9 +287,13 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         surahAverage: (data['surah_average'] as num?)?.toDouble() ?? state.surahAverage,
         currentAyah: finalAyahId,
         nextAyah: nextAyah,
-        ayahWER: ayahWER,
-        surahWER: (data['surah_wer'] as num?)?.toDouble() ?? state.surahWER,
-        diff: _parseDiff(data['diff']),
+        ayahPER: ayahPER,
+        surahPER: (data['surah_per'] as num?)?.toDouble() ?? state.surahPER,
+        diff: data.containsKey('diff') ? _parseDiff(data['diff']) : state.diff,
+        ayahDiffs: ayahDiffs,
+        ayahExpected: ayahExpected,
+        ayahPredicted: ayahPredicted,
+        ayahMistakes: ayahMistakes,
       );
       print("📈 [SURAH STATE] avg=${state.surahAverage} current=${state.currentAyah}");
     } else {
@@ -330,8 +350,9 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         expected: data['expected']?.toString() ?? state.expected,
         predicted: data['predicted']?.toString() ?? state.predicted,
         accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
-        wer: (data['wer'] as num?)?.toDouble() ?? state.wer,
+        per: (data['per'] as num?)?.toDouble() ?? state.per,
         diff: _parseDiff(data['diff']),
+        mistakes: (data['mistakes'] as List?)?.map((e) => e.toString()).toList() ?? state.mistakes,
       );
     }
   }
