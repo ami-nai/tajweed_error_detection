@@ -151,12 +151,19 @@ class RecitationPage extends ConsumerWidget {
                         ),
                       ),
                       const SizedBox(height: 6),
+                      if (recitationState.surahWER > 0) ...[
+                        Text(
+                          'Surah WER: ${recitationState.surahWER.toStringAsFixed(1)}%',
+                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.black54),
+                        ),
+                        const SizedBox(height: 6),
+                      ],
                       if (recitationState.currentAyah != 0)
                         Text(
                           'Current Ayah: ${recitationState.currentAyah}',
                           style: const TextStyle(fontSize: 14, color: Colors.black54),
                         ),
-                    ] else
+                    ] else ...[
                       Text(
                         'Accuracy: ${recitationState.accuracy.toStringAsFixed(1)}%',
                         style: TextStyle(
@@ -169,26 +176,24 @@ class RecitationPage extends ConsumerWidget {
                                   : Colors.redAccent,
                         ),
                       ),
+                      if (recitationState.wer > 0) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          'WER: ${recitationState.wer.toStringAsFixed(1)}%',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black54),
+                        ),
+                      ],
+                    ],
                     const SizedBox(height: 12),
                     Text('Real Transcription:',
                         style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
                     const SizedBox(height: 4),
-                    Text(
-                      recitationState.expected.isEmpty
-                          ? '—'
-                          : recitationState.expected,
-                      style: const TextStyle(fontSize: 18, height: 1.4),
-                    ),
+                    _buildDiffText(recitationState.diff, showExpected: true, empty: recitationState.expected),
                     const SizedBox(height: 12),
                     Text('Predicted Transcription:',
                         style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54)),
                     const SizedBox(height: 4),
-                    Text(
-                      recitationState.predicted.isEmpty
-                          ? '—'
-                          : recitationState.predicted,
-                      style: const TextStyle(fontSize: 18, height: 1.4),
-                    ),
+                    _buildDiffText(recitationState.diff, showExpected: false, empty: recitationState.predicted),
                   ],
                 ),
               ),
@@ -274,13 +279,65 @@ class RecitationPage extends ConsumerWidget {
         runSpacing: 16.0,
         alignment: WrapAlignment.center,
         children: words.map((word) {
-          return _wordChild(word.text, word.isRead);
+          return _wordChild(word);
         }).toList(),
       ),
     );
   }
 
-  Widget _wordChild(String text, bool isRead) {
+  Widget _wordChild(WordTrackResult word) {
+    final Color teal = Colors.teal;
+
+    // Fallback: if no letter-level data is available, color the whole word.
+    if (word.letters.isEmpty) {
+      return _wordContainer(
+        word.text,
+        RichText(
+          text: TextSpan(
+            text: word.text,
+            style: TextStyle(
+              fontSize: 32,
+              fontWeight: FontWeight.w600,
+              fontFamily: 'Amiri',
+              color: word.isRead ? teal : Colors.black87,
+            ),
+          ),
+        ),
+        word.isRead,
+      );
+    }
+
+    return _wordContainer(
+      word.text,
+      Directionality(
+        textDirection: TextDirection.rtl,
+        child: RichText(
+          textAlign: TextAlign.center,
+          text: TextSpan(
+            children: word.letters.map((letter) {
+              final Color color = switch (letter.status) {
+                LetterStatus.ok => teal,
+                LetterStatus.miss => Colors.redAccent,
+                LetterStatus.neutral => Colors.black87,
+              };
+              return TextSpan(
+                text: letter.ch,
+                style: TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.w600,
+                  fontFamily: 'Amiri',
+                  color: color,
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+      word.isRead,
+    );
+  }
+
+  Widget _wordContainer(String semantics, Widget child, bool isRead) {
     return AnimatedContainer(
       duration: const Duration(milliseconds: 200),
       padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
@@ -288,13 +345,37 @@ class RecitationPage extends ConsumerWidget {
         color: isRead ? Colors.teal.withOpacity(0.1) : Colors.transparent,
         borderRadius: BorderRadius.circular(4),
       ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 32,
-          fontWeight: FontWeight.w600,
-          fontFamily: 'Amiri',
-          color: isRead ? Colors.teal : Colors.black87,
+      child: child,
+    );
+  }
+
+  Widget _buildDiffText(List<DiffHit> diff, {required bool showExpected, required String empty}) {
+    if (diff.isEmpty) {
+      return Text(empty.isEmpty ? '—' : empty, style: const TextStyle(fontSize: 18, height: 1.4));
+    }
+
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: RichText(
+        textAlign: TextAlign.right,
+        text: TextSpan(
+          children: diff.map((d) {
+            final String? ch = showExpected ? d.e : d.h;
+            if (ch == null) return const TextSpan(text: '');
+            final bool isSpace = ch.trim().isEmpty;
+            Color color;
+            if (isSpace) {
+              color = Colors.black87;
+            } else if (showExpected) {
+              color = d.status == 'M' ? Colors.teal : Colors.redAccent;
+            } else {
+              color = (d.status == 'M' || d.status == 'D') ? Colors.teal : Colors.redAccent;
+            }
+            return TextSpan(
+              text: ch,
+              style: TextStyle(fontSize: 18, height: 1.4, color: color),
+            );
+          }).toList(),
         ),
       ),
     );
@@ -333,6 +414,7 @@ class RecitationPage extends ConsumerWidget {
           final words = state.surahWords[aId] ?? [];
           final isCurrent = aId == readNow;
           final ayahAcc = state.ayahAccuracies[aId];
+          final ayahWer = state.ayahWER[aId];
           return Container(
             margin: const EdgeInsets.symmetric(vertical: 6.0),
             padding: const EdgeInsets.all(10),
@@ -351,10 +433,16 @@ class RecitationPage extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  // Ayah label + (optional) per-ayah accuracy + "read now" flag
+                  // Ayah label + (optional) per-ayah accuracy + WER + "read now" flag
                   Row(
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
+                      if (ayahWer != null && ayahWer > 0)
+                        Text(
+                          'WER ${ayahWer.toStringAsFixed(0)}%',
+                          style: const TextStyle(
+                              fontSize: 13, color: Colors.redAccent, fontWeight: FontWeight.w600),
+                        ),
                       if (ayahAcc != null)
                         Text(
                           ' ${ayahAcc.toStringAsFixed(0)}%',
@@ -390,7 +478,7 @@ class RecitationPage extends ConsumerWidget {
                     spacing: 10.0,
                     runSpacing: 12.0,
                     alignment: WrapAlignment.end,
-                    children: words.map((word) => _wordChild(word.text, word.isRead)).toList(),
+                    children: words.map((word) => _wordChild(word)).toList(),
                   ),
                 ],
               ),

@@ -49,6 +49,16 @@ const String kBackendUrl = String.fromEnvironment(
   defaultValue: 'ws://192.168.1.113:8000',
 );
 
+List<DiffHit> _parseDiff(Object? diff) {
+  if (diff is! List) return [];
+  return diff.map((e) {
+    if (e is Map) {
+      return DiffHit.fromJson(e.cast<String, dynamic>());
+    }
+    return DiffHit(status: 'S');
+  }).toList();
+}
+
 final dataSourceProvider = Provider((ref) {
   return RecitationRemoteDataSource(kBackendUrl);
 });
@@ -130,6 +140,9 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       currentAyah: 0,
       nextAyah: 0,
       words: [],
+      ayahWER: {},
+      surahWER: 0,
+      diff: [],
     );
   }
 
@@ -212,6 +225,12 @@ class RecitationNotifier extends Notifier<RecitationResult> {
               return WordTrackResult(
                 text: item['text']?.toString() ?? '',
                 isRead: item['is_read'] == true || item['isRead'] == true,
+                letters: (item['letters'] as List?)?.map((l) {
+                  if (l is Map) {
+                    return LetterHit.fromJson(l.cast<String, dynamic>());
+                  }
+                  return LetterHit(ch: l.toString(), status: LetterStatus.neutral);
+                }).toList(),
               );
             }
             return WordTrackResult(text: item.toString(), isRead: false);
@@ -233,6 +252,15 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         });
       }
 
+      // WER per ayah
+      final ayahWER = <int, double>{};
+      final werData = data['ayah_wers'];
+      if (werData is Map) {
+        werData.forEach((k, v) {
+          if (v != null) ayahWER[int.parse(k.toString())] = (v as num).toDouble();
+        });
+      }
+
       final isFinished = data['finished'] == true;
       final nextAyah = (data['next_ayah'] as num?)?.toInt() ?? 0;
       state = state.copyWith(
@@ -243,14 +271,19 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         surahAverage: (data['surah_average'] as num?)?.toDouble() ?? state.surahAverage,
         currentAyah: finalAyahId,
         nextAyah: nextAyah,
+        ayahWER: ayahWER,
+        surahWER: (data['surah_wer'] as num?)?.toDouble() ?? state.surahWER,
+        diff: _parseDiff(data['diff']),
       );
       print("📈 [SURAH STATE] avg=${state.surahAverage} current=${state.currentAyah}");
     } else {
       // Single ayah mode (original logic)
       List<String> recognizedWords = [];
+      List<dynamic> serverWords = [];
       if (data.containsKey('words')) {
         final words = data['words'];
         if (words is List) {
+          serverWords = words;
           for (var item in words) {
             if (item is Map) {
               if (item['is_read'] == true || item['isRead'] == true) {
@@ -265,10 +298,30 @@ class RecitationNotifier extends Notifier<RecitationResult> {
 
       final normalizedBackend = recognizedWords.map((w) => _normalizeArabic(w)).toList();
 
-      final mergedWords = state.words.map((localWord) {
+      final mergedWords = state.words.asMap().entries.map((entry) {
+        final index = entry.key;
+        final localWord = entry.value;
         final normalizedLocal = _normalizeArabic(localWord.text);
         bool isWordRead = localWord.isRead || normalizedBackend.contains(normalizedLocal);
-        return WordTrackResult(text: localWord.text, isRead: isWordRead);
+
+        // Carry per-letter highlights from the server (align by index; server
+        // keeps the same word order as the local ayah words).
+        List<LetterHit> letters = localWord.letters;
+        if (index < serverWords.length && serverWords[index] is Map) {
+          final sw = (serverWords[index] as Map).cast<String, dynamic>();
+          final sRead = sw['is_read'] == true || sw['isRead'] == true;
+          isWordRead = isWordRead || sRead;
+          if (sw['letters'] is List) {
+            letters = (sw['letters'] as List).map((l) {
+              if (l is Map) {
+                return LetterHit.fromJson(l.cast<String, dynamic>());
+              }
+              return LetterHit(ch: l.toString(), status: LetterStatus.neutral);
+            }).toList();
+          }
+        }
+
+        return WordTrackResult(text: localWord.text, isRead: isWordRead, letters: letters);
       }).toList();
 
       state = state.copyWith(
@@ -277,6 +330,8 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         expected: data['expected']?.toString() ?? state.expected,
         predicted: data['predicted']?.toString() ?? state.predicted,
         accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
+        wer: (data['wer'] as num?)?.toDouble() ?? state.wer,
+        diff: _parseDiff(data['diff']),
       );
     }
   }

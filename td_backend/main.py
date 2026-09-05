@@ -55,18 +55,27 @@ async def websocket_stream(websocket: WebSocket):
             session_ayahs = get_surah_ayah_ids(surah_id)
             session_read = {
                 a_id: [
-                    {"text": w["text"], "is_read": False}
+                    {
+                        "text": w["text"],
+                        "is_read": False,
+                        "letters": [],
+                    }
                     for w in TAJWEED_ONLY_INDEX[surah_id][a_id]["words"]
                 ]
                 for a_id in session_ayahs
             }
             ayah_accuracies = {a_id: None for a_id in session_ayahs}
+            ayah_wers = {a_id: None for a_id in session_ayahs}
             # Index into session_ayahs for sequential advancement
             ayah_index = 0
             print(f"→ Surah mode: {len(session_ayahs)} ayahs loaded for surah {surah_id}.")
         else:
             session_words = [
-                {"text": w["text"], "is_read": False}
+                {
+                    "text": w["text"],
+                    "is_read": False,
+                    "letters": [],
+                }
                 for w in TAJWEED_ONLY_INDEX[surah_id][ayah_id]["words"]
             ] if ayah_id in TAJWEED_ONLY_INDEX[surah_id] else []
             ayah_index = None
@@ -163,6 +172,8 @@ async def _handle_single_pause(websocket, surah_id, ayah_id, session_words, tmp_
     for i, word in enumerate(detected_chunk_words):
         if i < len(session_words) and word["is_read"]:
             session_words[i]["is_read"] = True
+            if word.get("letters"):
+                session_words[i]["letters"] = word["letters"]
 
     print(f"📤 [SERVER] Sending single-ayah states to Flutter: {session_words}")
     await websocket.send_json(
@@ -174,6 +185,8 @@ async def _handle_single_pause(websocket, surah_id, ayah_id, session_words, tmp_
             "expected": chunk_result.get("expected", ""),
             "predicted": chunk_result.get("predicted", ""),
             "accuracy": chunk_result.get("accuracy", 0.0),
+            "wer": chunk_result.get("wer", 0.0),
+            "diff": chunk_result.get("diff", []),
         }
     )
 
@@ -196,12 +209,17 @@ async def _handle_surah_pause(websocket, surah_id, session_read, ayah_accuracies
     for i, word in enumerate(detected_chunk_words):
         if i < len(ayah_words) and word["is_read"]:
             ayah_words[i]["is_read"] = True
+            if word.get("letters"):
+                ayah_words[i]["letters"] = word["letters"]
 
     ayah_accuracies[target_ayah] = chunk_result.get("accuracy", 0.0)
+    ayah_wers[target_ayah] = chunk_result.get("wer", 0.0)
 
     # Running surah average over recognized ayahs only
     scored = [acc for acc in ayah_accuracies.values() if acc is not None]
     surah_average = round(sum(scored) / len(scored), 2) if scored else 0.0
+    scored_wer = [w for w in ayah_wers.values() if w is not None]
+    surah_wer = round(sum(scored_wer) / len(scored_wer), 2) if scored_wer else 0.0
 
     # Flatten words into a list of ayah word-lists in order for the client
     words_by_ayah = [
@@ -218,6 +236,9 @@ async def _handle_surah_pause(websocket, surah_id, session_read, ayah_accuracies
             "words": words_by_ayah,
             "ayah_accuracies": ayah_accuracies,
             "surah_average": surah_average,
+            "ayah_wers": ayah_wers,
+            "surah_wer": surah_wer,
+            "diff": chunk_result.get("diff", []),
             "finished": False,
         }
     )

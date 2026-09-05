@@ -210,6 +210,109 @@ def strip_diacritics(s):
     return "".join(c for c in s if c not in DIACRITICS_STRIP())
 
 
+def _align_with_ops(ref, hyp):
+    """Levenshtein alignment with traceback.
+
+    Returns a list of (ref_char, hyp_char) pairs aligned position by position,
+    where either side may be None to represent a deletion/insertion gap.
+    """
+    import unicodedata  # noqa
+
+    n, m = len(ref), len(hyp)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = i
+    for j in range(1, m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if ref[i - 1] == hyp[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j - 1] + cost,
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+            )
+
+    pairs = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + (
+            0 if ref[i - 1] == hyp[j - 1] else 1
+        ):
+            pairs.append((ref[i - 1], hyp[j - 1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+            pairs.append((ref[i - 1], None))
+            i -= 1
+        elif j > 0 and dp[i][j] == dp[i][j - 1] + 1:
+            pairs.append((None, hyp[j - 1]))
+            j -= 1
+        elif i > 0 and j > 0:
+            pairs.append((ref[i - 1], hyp[j - 1]))
+            i -= 1
+            j -= 1
+        elif i > 0:
+            pairs.append((ref[i - 1], None))
+            i -= 1
+        else:
+            pairs.append((None, hyp[j - 1]))
+            j -= 1
+    pairs.reverse()
+    return pairs
+
+
+def _is_diacritic(ch):
+    import unicodedata
+
+    if ch in DIACRITICS_STRIP():
+        return True
+    return unicodedata.category(ch).startswith("M")
+
+
+def _assign_letters(display_text, consonant_statuses):
+    """Build the per-character {ch, status} list for a displayed word.
+
+    consonant_statuses: list of 'ok'/'miss' aligned to the word's consonants
+    (as the model sees them). Diacritics and out-of-vocabulary letters render
+    as 'neutral'; remaining consonants without a known status default to 'miss'.
+    """
+    letters = []
+    cidx = 0
+    for ch in display_text:
+        if _is_diacritic(ch):
+            letters.append({"ch": ch, "status": "neutral"})
+        elif ch in TRAINED_PHONEMES:
+            status = consonant_statuses[cidx] if cidx < len(consonant_statuses) else "miss"
+            letters.append({"ch": ch, "status": status})
+            cidx += 1
+        else:
+            letters.append({"ch": ch, "status": "neutral"})
+    return letters
+
+
+def _compute_wer(ref_words, hyp_words):
+    """Standard word error rate (%) via Levenshtein over word lists."""
+    if not ref_words:
+        return 0.0
+    n, m = len(ref_words), len(hyp_words)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = i
+    for j in range(1, m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if ref_words[i - 1] == hyp_words[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j - 1] + cost,
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+            )
+    dist = dp[n][m]
+    return round(min(dist / n * 100, 100.0), 2)
+
+
 def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
     if (
         surah_id not in TAJWEED_ONLY_INDEX
@@ -222,6 +325,7 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
 
     word_results = []
     expected_parts = []
+    ref_words = []
 
     # Helper function to extract valid matching letters from raw text if phonetizer fails
     def get_fallback_target(raw_text):
@@ -263,37 +367,63 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
 
         # If both attempts yield no trackable characters, skip safely
         if not target_str:
-            word_results.append({"text": word_obj["text"], "is_read": False})
+            word_results.append(
+                {"text": word_obj["text"], "is_read": False, "letters": _assign_letters(word_obj["text"], [])}
+            )
             continue
 
         expected_parts.append(target_str)
 
         target_stripped = strip_diacritics(target_str)
+        ref_words.append(target_stripped)
 
+        win_len = len(target_stripped)
         has_been_read = False
+        best_i = None
+        best_dist = None
+
         # Exact substring match (compare consonant-only for robustness)
         if target_stripped in pred_stripped:
             has_been_read = True
+            best_i = pred_stripped.index(target_stripped)
+            best_dist = 0
         else:
             # Fallback sliding window Levenshtein matching
-            win_len = len(target_stripped)
             if len(pred_stripped) >= win_len:
                 for i in range(len(pred_stripped) - win_len + 1):
                     sub = pred_stripped[i : i + win_len]
                     dist = Levenshtein.distance(sub, target_stripped)
+                    if best_i is None or dist < best_dist:
+                        best_i, best_dist = i, dist
                     if dist <= max(1, int(win_len * 0.35)):
                         has_been_read = True
                         break
             else:
                 dist = Levenshtein.distance(pred_stripped, target_stripped)
+                best_i, best_dist = 0, dist
                 has_been_read = (
                     (dist <= max(1, int(win_len * 0.4))) if pred_stripped else False
                 )
 
+        # Build per-letter statuses for this word.
+        consonant_statuses = []
+        if has_been_read and best_i is not None:
+            window = pred_stripped[best_i : best_i + win_len]
+            for rc, hc in _align_with_ops(target_stripped, window):
+                if rc is None:
+                    continue
+                consonant_statuses.append("ok" if hc == rc else "miss")
+        else:
+            consonant_statuses = ["miss"] * win_len
+
+        letters = _assign_letters(word_obj["text"], consonant_statuses)
+
         print(
             f"   -> Word: '{word_obj['text']}' | Target Check: '{target_stripped}' vs Predicted: '{pred_stripped}' -> Result: {has_been_read}"
         )
-        word_results.append({"text": word_obj["text"], "is_read": has_been_read})
+        word_results.append(
+            {"text": word_obj["text"], "is_read": has_been_read, "letters": letters}
+        )
 
     real_text = " ".join(w["text"] for w in word_data)
     expected_full = TAJWEED_ONLY_INDEX[surah_id][ayah_id].get("expected_full", "")
@@ -301,12 +431,31 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
     dist = Levenshtein.distance(pred_str, expected_str) if expected_str else 0
     accuracy = max(0, 100 - (dist / len(expected_str) * 100)) if expected_str else 0.0
 
+    # Word Error Rate: compare expected words vs predicted words (space delimited).
+    hyp_words = strip_diacritics(pred_str).split() if pred_str.strip() else []
+    wer = _compute_wer(ref_words, hyp_words)
+
+    # Full-ayah alignment diff for the colored transcription lines.
+    diff = []
+    for e, h in _align_with_ops(expected_str, pred_str):
+        if e is None:
+            status = "I"
+        elif h is None:
+            status = "D"
+        elif e == h:
+            status = "M"
+        else:
+            status = "S"
+        diff.append({"e": e, "h": h, "status": status})
+
     return {
         "words": word_results,
         "real_text": real_text,
         "expected": expected_str,
         "predicted": pred_str,
         "accuracy": round(accuracy, 2),
+        "wer": wer,
+        "diff": diff,
     }
 
 
