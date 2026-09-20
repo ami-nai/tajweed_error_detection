@@ -62,6 +62,7 @@ class RecitationRemoteDataSource {
   final String baseUrl;
   
   StreamSubscription<Uint8List>? _micStreamSubscription;
+  bool _channelClosed = false;
 
   RecitationRemoteDataSource(this.baseUrl);
 
@@ -77,6 +78,13 @@ class RecitationRemoteDataSource {
       throw Exception("Microphone permission denied");
     }
 
+    // Unwind any previous take first: a stale live mic subscription would keep
+    // feeding into the last (closed) channel and spam 'Cannot add event after
+    // closing' on every chunk.
+    await _safeCancelMic();
+    await _safeStopRecorder();
+
+    _channelClosed = false;
     _channel = WebSocketChannel.connect(Uri.parse('$baseUrl/ws/recite'));
 
     // 1. Send the identifying target Surah metadata string (with explicit mode)
@@ -95,10 +103,28 @@ class RecitationRemoteDataSource {
       ),
     );
 
-    // 3. Pipe the microphone bytes directly into the WebSocket
-    _micStreamSubscription = audioStream.listen((data) {
-      _channel?.sink.add(data);
-    });
+    // 3. Pipe the microphone bytes directly into the WebSocket. The channel can be
+    // closed at any moment (server final, drop, force-close); a post-close
+    // sink.add throws StateError, so guard, log once, and stop the mic feed.
+    _micStreamSubscription = audioStream.listen(
+      (data) {
+        if (_channelClosed) return;
+        try {
+          _channel?.sink.add(data);
+        } on StateError {
+          _channelClosed = true;
+          print("⚠️ [WS SINK CLOSED] dropping mic chunks after channel close (logged once)");
+          _safeCancelMic();
+        }
+      },
+      onError: (error) {
+        print("❌ [MIC STREAM ERROR] Recorder stream failed: $error");
+        _safeCancelMic();
+      },
+      onDone: () {
+        _micStreamSubscription = null;
+      },
+    );
 
     // 4. Return the WebSocket stream so the presentation layer can listen for model responses
     return _channel!.stream;
@@ -110,6 +136,23 @@ class RecitationRemoteDataSource {
     } catch (_) {}
   }
 
+  // Idempotent, exception-proof mic teardown (record's cancel/stop can throw on
+  // an already-stopped recorder, e.g. on double stop or device-level errors).
+  Future<void> _safeCancelMic() async {
+    final sub = _micStreamSubscription;
+    _micStreamSubscription = null;
+    if (sub == null) return;
+    try {
+      await sub.cancel();
+    } catch (_) {}
+  }
+
+  Future<void> _safeStopRecorder() async {
+    try {
+      await _audioRecorder.stop();
+    } catch (_) {}
+  }
+
   // Surah mode: user finished the current ayah -> server scores it and advances.
   Future<void> nextAyah() => _sendControl('next');
 
@@ -117,13 +160,15 @@ class RecitationRemoteDataSource {
   // channel is intentionally left open so the server's {final:true} message can
   // be delivered; the server closes it afterwards.
   Future<void> stopStreaming() async {
-    await _micStreamSubscription?.cancel();
-    await _audioRecorder.stop();
+    await _safeCancelMic();
+    await _safeStopRecorder();
+    _channelClosed = true;
     await _sendControl('stop');
   }
 
   // Force-closes the channel (used as a fallback if the server never replies).
   Future<void> forceClose() async {
+    _channelClosed = true;
     await _channel?.sink.close();
   }
 
@@ -131,11 +176,11 @@ class RecitationRemoteDataSource {
   // the connection already broke (provider onError): a 'stop' here would make
   // the server finalize mid-recite. The Stop button is the only finalize path.
   Future<void> abortStreaming() async {
-    await _micStreamSubscription?.cancel();
-    _micStreamSubscription = null;
+    _channelClosed = true;
+    await _safeCancelMic();
+    await _safeStopRecorder();
     try {
-      await _audioRecorder.stop();
+      await _channel?.sink.close();
     } catch (_) {}
-    await _channel?.sink.close();
   }
 }

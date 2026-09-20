@@ -6,10 +6,12 @@ Run from td_backend with the fastapienv interpreter:
 
 import asyncio
 import json
+import struct
 import time
 
 from fastapi.testclient import TestClient
 import main
+import ml_engine
 
 client = TestClient(main.app)
 
@@ -20,6 +22,16 @@ class _FakeWs:
 
     async def send_json(self, payload):
         self.sent.append(payload)
+
+
+def _noise_bytes(byte_len: int) -> bytes:
+    """16-bit PCM that reads as 'speech' to the energy gate (RMS 500), fully
+    deterministic so the fast smoke fixtures keep working once silence-gating
+    is applied. Plain zero-filled audio is silence by definition and would be
+    skipped by the gate before decode is even called."""
+    return b"".join(
+        struct.pack("<h", 500 if i % 2 == 0 else -500) for i in range(byte_len // 2)
+    )
 
 
 def _make_session():
@@ -36,6 +48,16 @@ def _stub_resolve(result):
     return _inner, collected
 
 
+def _stub_advance(result):
+    collected = {"calls": 0}
+
+    def _inner(pred_str, cur_s, cur_a, allowed_surahs=None):
+        collected["calls"] += 1
+        return result
+
+    return _inner, collected
+
+
 async def _advance_commits_later_ayah():
     s = _make_session()
     s.resolved = (111, 1)
@@ -45,8 +67,8 @@ async def _advance_commits_later_ayah():
     s.guided._idx = len(s.guided.words)  # exhaust the first ayah
     s.audio.extend(b"\x00\x00" * 16000)  # pretend audio has accumulated
     s.feed_tail = "يبايدواحمليدةوايديحمادننوليبدونا"
-    stub, _ = _stub_resolve((111, 2, 5, 0.1, 25))
-    main.resolve_ayah = stub
+    stub, _ = _stub_advance((111, 2, 0.92))
+    main.advance_target = stub
     await s._maybe_advance_openmic()
     assert s.resolved == (111, 2), s.resolved
     assert s.ayah_id == 2
@@ -60,7 +82,7 @@ async def _advance_commits_later_ayah():
 
 
 async def _same_or_backward_never_advances():
-    # Resolve returns the SAME ayah -> must not advance.
+    # advance returns the SAME ayah -> the forward guard blocks the commit.
     s = _make_session()
     s.resolved = (111, 1)
     s.surah_id = 111
@@ -68,13 +90,13 @@ async def _same_or_backward_never_advances():
     s._init_guided()
     s.guided._idx = len(s.guided.words)
     s.feed_tail = "فياداومالنبنرتدب"
-    stub, collected = _stub_resolve((111, 1, 2, 0.2, 20))
-    main.resolve_ayah = stub
+    stub, _ = _stub_advance((111, 1, 0.8))
+    main.advance_target = stub
     await s._maybe_advance_openmic()
     assert s.resolved == (111, 1), s.resolved
     assert s.feed_tail == "فياداومالنبنرتدب", s.feed_tail
 
-    # Resolve returns a BACKWARD ayah -> must not advance.
+    # advance returns a BACKWARD ayah -> must not advance.
     s2 = _make_session()
     s2.resolved = (111, 2)
     s2.surah_id = 111
@@ -82,8 +104,8 @@ async def _same_or_backward_never_advances():
     s2._init_guided()
     s2.guided._idx = len(s2.guided.words)
     s2.feed_tail = "منولهولنحيوااللهدالاعلىعلي"
-    stub2, _ = _stub_resolve((111, 1, 9, 0.3, 30))
-    main.resolve_ayah = stub2
+    stub2, _ = _stub_advance((111, 1, 0.7))
+    main.advance_target = stub2
     await s2._maybe_advance_openmic()
     assert s2.resolved == (111, 2), s2.resolved
 
@@ -99,13 +121,35 @@ async def _cooldown_prevents_spam():
     s._init_guided()
     s.guided._idx = len(s.guided.words)
     s.feed_tail = "لاييداوامالحن"
-    s._om_last_attempt = 10 ** 9  # a fresh scan is far above the cooldown budget
-    stub, collected = _stub_resolve((111, 2, 5, 0.1, 25))
-    main.resolve_ayah = stub
+    s._om_last_attempt = 10 ** 9  # clean can never grow past it
+    s._om_ticks_at_attempt = s._tick_cnt  # 0 beats elapsed -> still cooling down
+    stub, collected = _stub_advance((111, 2, 0.85))
+    main.advance_target = stub
     await s._maybe_advance_openmic()
-    assert collected["calls"] == 0, "resolve must not run during cooldown"
+    assert collected["calls"] == 0, "advance must not run during cooldown"
     assert s.resolved == (111, 1), s.resolved
-    print("COOLDOWN OK -> resolve skipped during cooldown")
+    print("COOLDOWN OK -> advance skipped during cooldown")
+
+
+async def _advance_cooldown_recovers():
+    # The OLD absolute "+5 tokens" guard locked a capped window out forever
+    # (clean pinned at ~46, spam-logged 'cooldown' until stop). The new rule
+    # must retry at the SAME clean length once STALL_ADVANCE_TICKS beats pass.
+    s = _make_session()
+    s.resolved = (111, 1)
+    s.surah_id = 111
+    s.ayah_id = 1
+    s._init_guided()
+    s.guided._idx = len(s.guided.words)
+    s.feed_tail = "لاييداوامال حن وتب ما اغنى عنه ماله"
+    s._om_last_attempt = len(s._clean_openmic_tail(s.feed_tail))
+    s._om_ticks_at_attempt = s._tick_cnt - main.STALL_ADVANCE_TICKS
+    stub, collected = _stub_advance((111, 2, 0.9))
+    main.advance_target = stub
+    await s._maybe_advance_openmic()
+    assert collected["calls"] == 1, "must retry once the cooldown beats elapsed"
+    assert s.resolved == (111, 2), s.resolved
+    print("COOLDOWN-RECOVERY OK -> pinned window still retries after cooldown")
 
 
 async def _first_commit_keeps_audio_marker():
@@ -137,11 +181,11 @@ async def _windowed_resolve_and_trim():
     )
     calls = []
 
-    def stub(pred_str, surahs=None, err_rate=0.35, min_tokens=5):
+    def stub(pred_str, cur_s, cur_a, allowed_surahs=None):
         calls.append(pred_str)
-        return (111, 1, 2, 0.2, 20)  # same ayah -> forward-guard blocks the commit
+        return (111, 1, 0.2)  # same ayah -> forward-guard blocks the commit
 
-    main.resolve_ayah = stub
+    main.advance_target = stub
     await s._maybe_advance_openmic()
     assert len(calls) == 1
     assert "A" not in calls[0], f"stale prefix leaked into resolve window: {calls[0]!r}"
@@ -159,16 +203,17 @@ async def _stall_triggers_advance_without_full_confirmation():
     s.surah_id = 111
     s.ayah_id = 1
     s._init_guided()
-    original_predict = main.predict_phonemes_bytes
-    main.predict_phonemes_bytes = lambda _b: "zzzzzzzz"  # never matches the targets
-    stub, _ = _stub_resolve((111, 2, 5, 0.1, 25))
-    main.resolve_ayah = stub
+    original_decode = main.decode_live_window
+    # Phase A: the tick decodes a trailing window, not the raw delta.
+    main.decode_live_window = lambda _w, _n, _p, _f, _l: ("zzzzzzzz", None)  # never matches
+    stub, _ = _stub_advance((111, 2, 0.85))
+    main.advance_target = stub
     try:
         for _ in range(main.STALL_ADVANCE_TICKS):
-            s.audio.extend(b"\x00\x00" * 4000)  # +8000 bytes for the next beat
+            s.audio.extend(_noise_bytes(8000))  # +8000 bytes (speech-like) for the next beat
             await s.tick()
     finally:
-        main.predict_phonemes_bytes = original_predict
+        main.decode_live_window = original_decode
     assert s.resolved == (111, 2), s.resolved
     assert any(
         msg.get("detected") == {"surah_id": 111, "ayah_id": 2}
@@ -179,7 +224,7 @@ async def _stall_triggers_advance_without_full_confirmation():
 
 async def _low_bytes_still_streams_live():
     # A quiet heartbeat (< MIN_NEW_BYTES of new audio) must still push the live
-    # phoneme strip; predict must NOT be called on that beat.
+    # phoneme strip; the window decode must NOT run on that beat.
     s = _make_session()
     s.resolved = (111, 1)
     s.surah_id = 111
@@ -187,17 +232,17 @@ async def _low_bytes_still_streams_live():
     s._init_guided()
     s.audio.extend(b"\x00\x00" * 100)  # far below MIN_NEW_BYTES
     calls = {"n": 0}
-    original_predict = main.predict_phonemes_bytes
+    original_decode = main.decode_live_window
 
-    def boom(_b):
+    def boom(_w, _n, _p, _f, _l):
         calls["n"] += 1
-        raise AssertionError("predict must not run on a low-byte beat")
+        raise AssertionError("window decode must not run on a low-byte beat")
 
-    main.predict_phonemes_bytes = boom
+    main.decode_live_window = boom
     try:
         await s.tick()
     finally:
-        main.predict_phonemes_bytes = original_predict
+        main.decode_live_window = original_decode
     assert calls["n"] == 0
     assert s.closed is False
     assert len(s.ws.sent) == 1, s.ws.sent
@@ -212,21 +257,24 @@ async def _predict_error_keeps_session_alive():
     s.surah_id = 111
     s.ayah_id = 1
     s._init_guided()
-    s.audio.extend(b"\x00\x00" * 8000)  # >= MIN_NEW_BYTES -> decode runs
-    original_predict = main.predict_phonemes_bytes
+    s.audio.extend(_noise_bytes(8000))  # >= MIN_NEW_BYTES + speech-like (decode runs)
+    original_decode = main.decode_live_window
 
-    def boom(_b):
+    def boom(_w, _n, _p, _f, _l):
         raise RuntimeError("model exploded")
 
-    main.predict_phonemes_bytes = boom
+    main.decode_live_window = boom
     try:
         await s.tick()
     finally:
-        main.predict_phonemes_bytes = original_predict
+        main.decode_live_window = original_decode
     assert s.closed is False
-    s.audio.extend(b"\x00\x00" * 8000)
-    main.predict_phonemes_bytes = lambda _b: ""
-    await s.tick()
+    s.audio.extend(_noise_bytes(8000))
+    main.decode_live_window = lambda _w, _n, _p, _f, _l: ("", None)
+    try:
+        await s.tick()
+    finally:
+        main.decode_live_window = original_decode
     assert s.closed is False
     assert len(s.ws.sent) == 1
     print("PREDICT-ERROR OK -> session survives a bad inference beat")
@@ -255,13 +303,13 @@ async def _pre_detection_streams_live_each_tick():
     s = _make_session()  # open_mic, resolved=None
     s.feed_tail = ""  # clean tokens < MIN_RESOLVE_TOKENS
     s.audio.extend(b"\x00\x00" * 100)  # low byte -> live-only branch
-    original_predict = main.predict_phonemes_bytes
-    main.predict_phonemes_bytes = lambda _b: ""
+    original_decode = main.decode_live_window
+    main.decode_live_window = lambda _w, _n, _p, _f, _l: ("", None)
     try:
         for _ in range(3):
             await s.tick()
     finally:
-        main.predict_phonemes_bytes = original_predict
+        main.decode_live_window = original_decode
     assert len(s.ws.sent) == 3, s.ws.sent
     for msg in s.ws.sent:
         assert msg["mode"] == "open_mic"
@@ -270,11 +318,130 @@ async def _pre_detection_streams_live_each_tick():
     print("PRE-DETECT LIVE OK -> strip streams before any ayah is resolved")
 
 
+async def _silence_gate_skips_decode():
+    # A beat with >= MIN_NEW_BYTES of PURE SILENCE must skip the window decode
+    # entirely (energy gate) while still streaming the live interim. This pins
+    # the exact silent-hole Claude flagged in _predict_error_keeps_session_alive:
+    # without the gate running here, the covered path would silently test nothing.
+    s = _make_session()
+    s.resolved = (111, 1)
+    s.surah_id = 111
+    s.ayah_id = 1
+    s._init_guided()
+    s.audio.extend(b"\x00\x00" * 8000)  # >= MIN_NEW_BYTES but RMS 0 -> gated
+    calls = {"n": 0}
+    original_decode = main.decode_live_window
+
+    def boom(_w, _n, _p, _f, _l):
+        calls["n"] += 1
+        raise AssertionError("window decode must not run on a silence-gated beat")
+
+    main.decode_live_window = boom
+    try:
+        await s.tick()
+    finally:
+        main.decode_live_window = original_decode
+    assert calls["n"] == 0
+    assert s.closed is False
+    assert s.stream_pred_raw == ""
+    assert len(s.ws.sent) == 1, s.ws.sent
+    assert "live" in s.ws.sent[0]
+    print("SILENCE-GATE OK -> zero-RMS delta skips decode but still streams live")
+
+
+def _gate_stickiness():
+    # Hysteresis: borderline RMS must not flap. Ungated stays open through the
+    # dead zone (100..200); gated stays shut until strong speech. A single
+    # threshold would toggle on every 150-ish beat.
+    assert main._should_gate(50, False) is True
+    assert main._should_gate(99, False) is True
+    assert main._should_gate(100, False) is False
+    assert main._should_gate(150, False) is False
+    assert main._should_gate(150, True) is True
+    assert main._should_gate(199, True) is True
+    assert main._should_gate(200, True) is False
+    assert main._should_gate(500, True) is False
+    assert main._should_gate(500, False) is False
+    assert main._should_gate(0.0, False) is True
+    print("GATE-STICKINESS OK -> 100/200 hysteresis holds the dead zone")
+
+
+async def _frame_stride_probe():
+    # Empirical pin on the frame-index math Phase A slicing depends on: two
+    # inputs differing by exactly 10 CTC frames' worth of samples must decode
+    # to frame counts differing by exactly 10. The delta is exact even though
+    # absolute counts carry a constant conv edge effect, so this fails loudly
+    # if a future backbone ever breaks the slicer's core assumption.
+    n1 = ml_engine.CTC_STRIDE * 50
+    n2 = n1 + ml_engine.CTC_STRIDE * 10
+    f1 = len(ml_engine._infer_pred_ids(_noise_bytes(n1 * 2)))
+    f2 = len(ml_engine._infer_pred_ids(_noise_bytes(n2 * 2)))
+    assert f2 - f1 == 10, (f1, f2)
+    assert ml_engine.CTC_STRIDE * ml_engine.CTC_PAD_FRAMES == ml_engine.CTC_PAD_SAMPLES
+    print("FRAME-STRIDE OK -> +10 frames per +3200 samples; stride/pad consistent")
+
+
+async def _windowed_decode_emits_only_new_tail():
+    # Phase A slicing with stubbed frame ids (2='ت' 3='َ' 4='ب' 1=blank):
+    # consecutive windows tile exactly, and the collapse carryover suppresses
+    # a boundary duplicate that a fresh collapse would emit twice.
+    ids1 = [2] * 10 + [1] * 10 + [3] * 10 + [1] * 10  # 40 frames
+    ids2 = ids1 + [4] * 10                             # 50 frames
+    ids3 = ids2 + [1] * 10                             # 60 frames
+    frames = iter([ids1, ids2, ids3])
+    original_infer = ml_engine._infer_pred_ids
+    ml_engine._infer_pred_ids = lambda _b: list(next(frames))
+    try:
+        o1, p1 = ml_engine.decode_live_window(b"x", 0, None, True, main.LIVE_LEAD_FRAMES)
+        o2, p2 = ml_engine.decode_live_window(b"x", 10, p1, False, main.LIVE_LEAD_FRAMES)
+        o3, p3 = ml_engine.decode_live_window(b"x", 10, p2, False, main.LIVE_LEAD_FRAMES)
+    finally:
+        ml_engine._infer_pred_ids = original_infer
+    assert o1 == "ت", repr(o1)
+    # Without the carryover this slice would re-emit "ت" (prove the test bites):
+    assert ml_engine._collapse_pred_ids(ids2[9:19])[0] == "ت"
+    assert o2 == "", repr(o2)
+    assert p2 is None
+    assert o3 == "َ", repr(o3)
+    assert o1 + o2 + o3 == "تَ"
+    print("WINDOWED-SLICE OK -> tiles exactly, boundary dup suppressed")
+
+
+async def _advance_from_mid_ayah_matches_tail():
+    # The prefix trie cannot anchor a tail that starts mid-ayah. The new
+    # match-anywhere alignment must find 111:2 even when the window begins
+    # inside 111:1 and only reaches the start of 111:2.
+    exp2 = ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"]
+    tail = "لهب وتب " + exp2 + " م زيد"
+    res = ml_engine.advance_target(tail, 111, 1, {111})
+    assert res is not None, res
+    assert res[1] == 2, res
+    # Junk that matches nothing must not commit a bogus advance.
+    assert ml_engine.advance_target("zzzz zzzz", 111, 1, {111}) is None
+    # A tail that only covers the END of 111:1 must not invent a later ayah.
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    assert ml_engine.advance_target(exp1, 111, 1, {111}) is None
+    # Unknown surah / already-at-last-ayah boundaries.
+    assert ml_engine.advance_target(exp2, None, 1, {111}) is None
+    last = max(ml_engine.get_surah_ayah_ids(111))
+    assert ml_engine.advance_target(exp2, 111, last, {111}) is None
+    print("MID-AYAH MATCH OK -> window starting mid-ayah still anchors 111:2")
+
+
+def _multi_ayah_expected_span():
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    exp2 = ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"]
+    span = _make_session()._openmic_expected_span(111, 1, 2)
+    assert span == exp1 + " " + exp2, span
+    assert _make_session()._openmic_expected_span(111, 1, 1) == exp1
+    print("MULTI-AYAH SPAN OK -> final expected text covers the recited ayahs")
+
+
 def run_single():
     with client.websocket_connect("/ws/recite") as ws:
         ws.send_text(json.dumps({"mode": "single", "surah_id": 112, "ayah_id": 1}))
-        # ~0.5s of silence (decodes to blank tokens -> no interim words)
-        ws.send_bytes(b"\x00\x00" * 8000)
+        # ~0.5s of speech-like audio (keeps the live-decode path exercised)
+        ws.send_bytes(_noise_bytes(8000))
         time.sleep(1.3)
         ws.send_text(json.dumps({"type": "stop"}))
         final = None
@@ -293,7 +460,7 @@ def run_single():
 def run_openmic():
     with client.websocket_connect("/ws/recite") as ws:
         ws.send_text(json.dumps({"mode": "open_mic", "surah_id": None}))
-        ws.send_bytes(b"\x00\x00" * 8000)
+        ws.send_bytes(_noise_bytes(8000))
         time.sleep(1.3)
         ws.send_text(json.dumps({"type": "stop"}))
         final = None
@@ -311,7 +478,7 @@ def run_openmic():
 def run_surah():
     with client.websocket_connect("/ws/recite") as ws:
         ws.send_text(json.dumps({"mode": "surah", "surah_id": 112}))
-        ws.send_bytes(b"\x00\x00" * 8000)
+        ws.send_bytes(_noise_bytes(8000))
         time.sleep(1.3)
         ws.send_text(json.dumps({"type": "next"}))
         got = []
@@ -338,6 +505,7 @@ if __name__ == "__main__":
     asyncio.run(_advance_commits_later_ayah())
     asyncio.run(_same_or_backward_never_advances())
     asyncio.run(_cooldown_prevents_spam())
+    asyncio.run(_advance_cooldown_recovers())
     asyncio.run(_first_commit_keeps_audio_marker())
     asyncio.run(_windowed_resolve_and_trim())
     asyncio.run(_stall_triggers_advance_without_full_confirmation())
@@ -345,4 +513,10 @@ if __name__ == "__main__":
     asyncio.run(_predict_error_keeps_session_alive())
     asyncio.run(_send_failure_keeps_session_alive())
     asyncio.run(_pre_detection_streams_live_each_tick())
+    asyncio.run(_silence_gate_skips_decode())
+    _gate_stickiness()
+    asyncio.run(_frame_stride_probe())
+    asyncio.run(_windowed_decode_emits_only_new_tail())
+    asyncio.run(_advance_from_mid_ayah_matches_tail())
+    _multi_ayah_expected_span()
     print("ALL SMOKE TESTS PASSED")

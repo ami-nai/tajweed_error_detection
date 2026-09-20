@@ -2,15 +2,19 @@ import json
 import os
 import tempfile
 import asyncio
+
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from ml_engine import (
     TAJWEED_ONLY_INDEX,
     evaluate_audio,
     get_surah_ayah_ids,
-    predict_phonemes_bytes,
+    decode_live_window,
+    CTC_STRIDE,
     GuidedLiveTrie,
     resolve_ayah,
+    advance_target,
     strip_diacritics,
 )
 
@@ -18,12 +22,47 @@ app = FastAPI()
 
 EVAL_INTERVAL_SEC = 0.5
 MIN_NEW_BYTES = 8000
+# Open mic: hysteresis energy gate on heartbeat-delta RMS amplitude (16-bit
+# PCM). Drops into silence below SILENCE_RMS_THRESHOLD and only resumes
+# decoding above SPEECH_RMS_THRESHOLD, so a mic hovering between the two no
+# longer flaps decode on/off every beat. Skipped beats keep the live strip
+# and feed_tail free of hallucinated junk phonemes. Tune from the
+# 📊 [MIC LEVEL] summaries, not by guessing.
+SILENCE_RMS_THRESHOLD = 100
+SPEECH_RMS_THRESHOLD = 200
+# RMS stats are summarized to the log this often (eligible beats).
+MIC_LEVEL_LOG_EVERY = 10
 MIN_RESOLVE_TOKENS = 5
 # Open mic: if no new word confirms for STALL_ADVANCE_TICKS consecutive beats,
 # assume the user has moved on and re-resolve the ayah on a recent-token window.
 STALL_ADVANCE_TICKS = 3
 # Lower bound on the recent-token window used for ayah re-resolution.
 MIN_ADVANCE_WINDOW_TOKENS = 40
+# Phase A live decode: each speech beat decodes this trailing context window
+# (3 s) and emits only the newly-covered frames (see decode_live_window).
+# Right-context lookahead in frames: the emitted slice always ends this far
+# before the inference pad.
+LIVE_WINDOW_SAMPLES = 48000
+LIVE_LEAD_FRAMES = 16
+
+
+def _rms(audio_bytes: bytes) -> float:
+    """RMS amplitude of a 16-bit PCM delta; 0.0 for empty input."""
+    if not audio_bytes:
+        return 0.0
+    a = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float64)
+    if a.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(a * a)))
+
+
+def _should_gate(rms: float, currently_gated: bool) -> bool:
+    """Hysteresis gate decision: enter silence below SILENCE_RMS_THRESHOLD,
+    leave only above SPEECH_RMS_THRESHOLD. Sticky between the two so borderline
+    mic levels can't flap decoding on and off."""
+    if currently_gated:
+        return rms < SPEECH_RMS_THRESHOLD
+    return rms < SILENCE_RMS_THRESHOLD
 
 
 class Session:
@@ -76,7 +115,16 @@ class Session:
         self.openmic_ayah_start = 0
         self._om_scanning = False
         self._om_last_attempt = None
+        self._om_ticks_at_attempt = -STALL_ADVANCE_TICKS
+        self._tick_cnt = 0
         self._stall_ticks = 0
+        self._gate_silence = False
+        self._rms_n = 0
+        self._rms_sum = 0.0
+        self._rms_min = None
+        self._rms_max = None
+        self._win_prev = None
+        self._win_started = False
         self.guided = None
         self.resolved = None
         self.resolving_sent = False
@@ -137,14 +185,60 @@ class Session:
             # A single bad beat must never kill the session; log and carry on.
             print(f"⚠️ [TICK EXCEPTION] {type(exc).__name__}: {exc}")
 
+    def _rms_note(self, rms: float):
+        """Accumulate per-beat mic levels; every MIC_LEVEL_LOG_EVERY eligible
+        beats print a summary so real mic distributions (not guesses) drive
+        gate tuning."""
+        self._rms_n += 1
+        self._rms_sum += rms
+        self._rms_min = rms if self._rms_min is None else min(self._rms_min, rms)
+        self._rms_max = rms if self._rms_max is None else max(self._rms_max, rms)
+        if self._rms_n >= MIC_LEVEL_LOG_EVERY:
+            avg = self._rms_sum / self._rms_n
+            print(f"📊 [MIC LEVEL] beats={self._rms_n} avg={avg:.0f} "
+                  f"min={self._rms_min:.0f} max={self._rms_max:.0f} "
+                  f"gated={self._gate_silence}")
+            self._rms_n = 0
+            self._rms_sum = 0.0
+            self._rms_min = None
+            self._rms_max = None
+
     async def _tick_once(self):
+        self._tick_cnt += 1
         tok = ""
         if len(self.audio) - self.eval_pos >= MIN_NEW_BYTES:
             delta = bytes(self.audio[self.eval_pos :])
+            new_samples = len(delta) // 2
             self.eval_pos = len(self.audio)
-            tok = await asyncio.to_thread(predict_phonemes_bytes, delta)
-            self.stream_pred_raw += tok
-            self.feed_tail += tok
+            rms = _rms(delta)
+            self._rms_note(rms)
+            if _should_gate(rms, self._gate_silence):
+                # Silence separates utterances: drop the collapse carryover so
+                # a repeated phoneme after the pause is not wrongly merged.
+                # Everything downstream still runs (interim streaming, stall
+                # bookkeeping) with an empty batch of tokens.
+                self._win_prev = None
+                if not self._gate_silence:
+                    self._gate_silence = True
+                    print(f"🔇 [ENERGY GATE] silence beat (rms={rms:.0f}): decode skipped")
+            else:
+                if self._gate_silence:
+                    self._gate_silence = False
+                    print(f"🔊 [ENERGY GATE] speech beat (rms={rms:.0f}): decoding resumed")
+                # Phase A: decode the trailing context window, emit only the
+                # newly-covered frames (frame-index slicing + LEAD lookahead
+                # + collapse carryover inside decode_live_window).
+                n = len(self.audio)
+                start = max(0, n - LIVE_WINDOW_SAMPLES)
+                window = bytes(self.audio[start:])
+                new_frames = int(round(new_samples / CTC_STRIDE))
+                tok, self._win_prev = await asyncio.to_thread(
+                    decode_live_window, window, new_frames,
+                    self._win_prev, not self._win_started, LIVE_LEAD_FRAMES,
+                )
+                self._win_started = True
+                self.stream_pred_raw += tok
+                self.feed_tail += tok
 
         if self.mode in ("single", "surah") and self.guided is not None:
             self.guided.feed(tok)
@@ -198,9 +292,13 @@ class Session:
 
     def _clean_openmic_tail(self, src=None):
         source = src if src is not None else self.feed_tail
+        # Keep only canonical Arabic letters/digits, space, and the four live
+        # harakat (fatHa, Damma, Kasra, sukun + dagger/khandaq hints). ۦ (and
+        # any other junk token the model occasionally emits) is NOT a real
+        # tashkeel: it must never reach the ayah matcher.
         return "".join(
             c for c in source
-            if c in " " or c.isalnum() or c in "َُِّْٰٓۦ"
+            if c in " " or c.isalnum() or c in "َُِّْٰٓ"
         )
 
     async def _commit_openmic(self, s, a, score):
@@ -218,6 +316,7 @@ class Session:
         self._merge_newly(newly)
         self.resolving_sent = False
         self._om_last_attempt = None
+        self._om_ticks_at_attempt = -STALL_ADVANCE_TICKS
         self._stall_ticks = 0
         self.feed_tail = ""
         if not is_first:
@@ -227,6 +326,8 @@ class Session:
 
     async def _maybe_advance_openmic(self):
         if self._om_scanning or self.resolved is None or self.guided is None:
+            print(f"🔍 [ADVANCE] skip: scanning={self._om_scanning} "
+                  f"resolved={self.resolved} guided={self.guided is not None}")
             return
         # Resolve on the RECENT tokens only: the full feed_tail is polluted with
         # the previous ayah's stream and would match it again. Size the window
@@ -240,24 +341,45 @@ class Session:
         tail = self.feed_tail[-window_len:] if window_len > 0 else ""
         clean = self._clean_openmic_tail(tail)
         if len(clean) < MIN_RESOLVE_TOKENS:
+            print(f"🔍 [ADVANCE] need-more-tokens: clean={len(clean)}")
             return
-        if self._om_last_attempt is not None and len(clean) < self._om_last_attempt + MIN_RESOLVE_TOKENS:
+        # Cooldown: retry when the window has grown by at least one token OR
+        # STALL_ADVANCE_TICKS beats have passed since the last attempt. The
+        # recent-window is capped, so an absolute "+5 tokens" rule (the old
+        # guard) permanently locked the advance out at clean≈46.
+        grew = self._om_last_attempt is None or len(clean) > self._om_last_attempt
+        beats = self._tick_cnt - self._om_ticks_at_attempt
+        if not grew and beats < STALL_ADVANCE_TICKS:
+            print(f"🔍 [ADVANCE] cooldown: clean={len(clean)} last={self._om_last_attempt} "
+                  f"beats={beats}")
             return
         self._om_scanning = True
         self._om_last_attempt = len(clean)
+        self._om_ticks_at_attempt = self._tick_cnt
         try:
-            res = await asyncio.to_thread(resolve_ayah, tail, self.allowed_surahs)
+            # Match-from-anywhere alignment (see advance_target) so a tail that
+            # starts mid-ayah can still anchor the NEXT ayah. resolve_ayah's
+            # prefix trie cannot do this, which is why live advance kept failing
+            # even when the correct ayah's tokens were sitting in the tail.
+            res = await asyncio.to_thread(
+                advance_target, clean, self.surah_id, self.ayah_id, self.allowed_surahs
+            )
         finally:
             self._om_scanning = False
         # Whatever the outcome, drop the stale (previous-ayah) prefix now so the
         # window keeps sliding toward the most recent tokens on the next try.
         self.feed_tail = tail
         if res is None:
+            print(f"🔍 [ADVANCE] resolve=None (ambiguous/insufficient) tail={tail[-24:]!r}")
             return
-        s, a = res[0], res[1]
+        s, a, score = res
+        # advance_target can only emit later ayahs, but keep the guard as
+        # defense in depth against stubs/regressions.
         if (s, a) <= (self.surah_id, self.ayah_id):
+            print(f"🔍 [ADVANCE] blocked: winner={(s, a)} <= current={(self.surah_id, self.ayah_id)} "
+                  f"score={score}")
             return
-        await self._commit_openmic(s, a, res[3])
+        await self._commit_openmic(s, a, score)
 
     def _merge_newly(self, newly):
         if self.mode == "single":
@@ -294,6 +416,7 @@ class Session:
                     "final": False,
                     "ayah_id": self.ayah_id,
                     "words": self.session_words,
+                    "active_index": self.guided.active_index if self.guided else None,
                 })
             elif self.mode == "surah":
                 target = self.session_ayahs[self.ayah_index]
@@ -305,6 +428,7 @@ class Session:
                     "next_ayah": self.session_ayahs[self.ayah_index + 1] if self.ayah_index + 1 < len(self.session_ayahs) else None,
                     "ayah_order": self.session_ayahs,
                     "words": words_by_ayah,
+                    "active_index": self.guided.active_index if self.guided else None,
                 })
             elif self.mode == "open_mic":
                 await self.ws.send_json({
@@ -314,6 +438,7 @@ class Session:
                     "ayah_id": self.ayah_id,
                     "words": self.session_words,
                     "live": self.stream_pred_raw,
+                    "active_index": self.guided.active_index if self.guided else None,
                 })
         except Exception:
             # Transient send failure: keep the session alive and let the next
@@ -538,6 +663,27 @@ class Session:
                 for w in TAJWEED_ONLY_INDEX[s][a]["words"]
             ]
 
+        # Multi-ayah coverage: the "real transcription" should reflect how far
+        # the user actually recited, not just the last committed ayah. Re-run
+        # the advance matcher over the authoritative decode and extend the
+        # expected text with every later ayah it genuinely matches.
+        covered_last = a
+        decode_str = (chunk_result or {}).get("predicted", "") or self.stream_pred_raw
+        if self.resolved is not None and decode_str:
+            clean_decode = self._clean_openmic_tail(decode_str)
+            cov = await asyncio.to_thread(
+                advance_target, clean_decode, s, a, self.allowed_surahs
+            )
+            if cov:
+                covered_last = cov[1]
+                print(f"📚 [OPEN MIC] final coverage: ayahs {a}..{covered_last}")
+
+        expected = ""
+        if covered_last > a:
+            expected = self._openmic_expected_span(s, a, covered_last)
+        elif chunk_result:
+            expected = chunk_result.get("expected", "")
+
         payload = {
             "mode": "open_mic",
             "final": True,
@@ -547,8 +693,8 @@ class Session:
         }
         if chunk_result:
             payload.update({
-                "real_text": chunk_result.get("real_text", ""),
-                "expected": chunk_result.get("expected", ""),
+                "real_text": expected,
+                "expected": expected,
                 "predicted": chunk_result.get("predicted", ""),
                 "accuracy": chunk_result.get("accuracy", 0.0),
                 "per": chunk_result.get("per", 0.0),
@@ -556,6 +702,14 @@ class Session:
                 "mistakes": chunk_result.get("mistakes", []),
             })
         await self.ws.send_json(payload)
+
+    def _openmic_expected_span(self, s: int, low: int, high: int) -> str:
+        """Canonical expected text for the ayah range [low, high] of surah s."""
+        parts = []
+        for a_id in range(low, high + 1):
+            if a_id in TAJWEED_ONLY_INDEX.get(s, {}):
+                parts.append(TAJWEED_ONLY_INDEX[s][a_id]["expected_full"])
+        return " ".join(parts)
 
 
 @app.websocket("/ws/recite")

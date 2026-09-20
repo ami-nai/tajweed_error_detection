@@ -159,10 +159,32 @@ model.eval()
 extractor = AutoFeatureExtractor.from_pretrained("facebook/wav2vec2-base")
 
 
-def _bytes_to_prediction(audio_bytes: bytes) -> str:
-    """Run model inference over raw 16-bit PCM bytes, returning the decoded
-    phoneme prediction string (shared by evaluate_audio, live deltas, and
-    open-mic resolution)."""
+def _detect_ctc_stride() -> int:
+    """Samples-per-output-frame from the loaded wav2vec2 conv stack (product
+    of conv strides; 320 for wav2vec2-base). Computed, never hardcoded, so a
+    future backbone swap can't silently break frame-index slicing."""
+    try:
+        prod = 1
+        for layer in model.base.feature_extractor.conv_layers:
+            prod *= layer.conv.stride[0]
+        return int(prod)
+    except Exception as exc:
+        print(f"⚠️ [CTC STRIDE] introspection failed ({exc}); falling back to 320")
+        return 320
+
+
+CTC_STRIDE = _detect_ctc_stride()
+CTC_PAD_SAMPLES = 4800  # trailing zero-pad appended to every inference input
+CTC_PAD_FRAMES = CTC_PAD_SAMPLES // CTC_STRIDE
+print(f"CTC stride: {CTC_STRIDE} samples/frame, pad frames: {CTC_PAD_FRAMES}")
+
+
+def _infer_pred_ids(audio_bytes: bytes) -> list:
+    """Run model inference over raw 16-bit PCM bytes, returning the raw CTC
+    argmax id list (one id per output frame, blanks/pads included). Split out
+    of _bytes_to_prediction so overlapped-window live decoding can slice ids
+    at frame boundaries BEFORE collapse (see Phase A) instead of diffing
+    decoded text after the fact."""
     # 1. Convert raw bytes to numpy array (16-bit PCM)
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
     audio_np /= 32768.0
@@ -187,12 +209,21 @@ def _bytes_to_prediction(audio_bytes: bytes) -> str:
             logits = model(inputs)
             pred_ids = torch.argmax(logits[0], dim=-1)
 
-    # CTC Decode: collapse adjacent duplicates FIRST (preserves madd/long vowels),
-    # THEN remove blanks/pads. Matches notebook training decode (cell 13).
+    return [p.item() for p in pred_ids]
+
+
+def _collapse_pred_ids(pred_ids, prev_in=None):
+    """CTC Decode: collapse adjacent duplicates FIRST (preserves madd/long vowels),
+    THEN remove blanks/pads. Matches notebook training decode (cell 13).
+
+    prev_in threads the collapse state across slice boundaries: a phoneme
+    spanning a cut must not be emitted twice. Returns (text, prev_out) where
+    prev_out feeds the next slice. Called with no prev_in, prev_out is
+    discarded and behavior is exactly the legacy single-shot decode.
+    """
     final_pred = []
-    prev = None
-    for p in pred_ids:
-        token_id = p.item()
+    prev = prev_in
+    for token_id in pred_ids:
         if token_id in [0, 1]:  # skip <pad>, <blank> during collapse
             prev = None  # break adjacency across blanks
             continue
@@ -201,8 +232,14 @@ def _bytes_to_prediction(audio_bytes: bytes) -> str:
             if token_str != prev:
                 final_pred.append(token_str)
             prev = token_str
+    return "".join(final_pred), prev
 
-    pred_str = "".join(final_pred)
+
+def _bytes_to_prediction(audio_bytes: bytes) -> str:
+    """Run model inference over raw 16-bit PCM bytes, returning the decoded
+    phoneme prediction string (shared by evaluate_audio, live deltas, and
+    open-mic resolution)."""
+    pred_str, _ = _collapse_pred_ids(_infer_pred_ids(audio_bytes))
     print(f"🔮 [ML ENGINE] Cleaned AI Prediction String: '{pred_str}'")
     return pred_str
 
@@ -210,6 +247,34 @@ def _bytes_to_prediction(audio_bytes: bytes) -> str:
 def predict_phonemes_bytes(audio_bytes: bytes) -> str:
     """Public bytes-based prediction (live heartbeat deltas, open-mic lookup)."""
     return _bytes_to_prediction(audio_bytes)
+
+
+def decode_live_window(window_bytes: bytes, new_frames: int, prev, is_first: bool,
+                       lead_frames: int):
+    """Phase A live decode: infer CTC ids over a trailing context window, then
+    collapse ONLY the newly-covered frames.
+
+    window_bytes: trailing-window PCM (up to LIVE_WINDOW_SAMPLES of audio).
+    new_frames: output frames corresponding to audio not yet emitted.
+    prev: collapse carryover from the previous slice (None to start fresh).
+    is_first: first decode of the session -> emit from frame 0.
+    lead_frames: right-context lookahead; the slice always ends this far
+      before the pad so no emitted frame decodes with "silence ahead".
+      Consecutive slices tile exactly (experiment-verified).
+
+    Returns (text, prev_out). Empty text (not an error) when there is not yet
+    enough audio past the lookahead.
+    """
+    ids = _infer_pred_ids(window_bytes)
+    audio_frames = len(ids) - CTC_PAD_FRAMES
+    if is_first:
+        lo, hi = 0, audio_frames - lead_frames
+    else:
+        lo, hi = audio_frames - new_frames - lead_frames, audio_frames - lead_frames
+    lo = max(0, lo)
+    if hi <= lo:
+        return "", prev
+    return _collapse_pred_ids(ids[lo:hi], prev)
 
 
 def _predict_phonemes(audio_path: str) -> str:
@@ -595,6 +660,14 @@ class GuidedLiveTrie:
     def pending_tail(self):
         return self._tail
 
+    @property
+    def active_index(self):
+        """Index of the word currently expected next (the live 'spotlight'
+        pointer), or None once every word in the ayah has confirmed.
+        Read-only: only confirm() ever advances _idx, so reading this never
+        mutates trie state."""
+        return self._idx if self._idx < len(self.words) else None
+
     def feed(self, pred_str):
         self._tail += strip_diacritics(pred_str)
 
@@ -695,3 +768,72 @@ def resolve_ayah(pred_str, surahs=None, err_rate=0.35, min_tokens=5):
         err_rate=err_rate,
         min_tokens=min_tokens,
     )
+
+
+_ADVANCE_MIN_ANCHOR = 5
+_ADVANCE_ERR_RATE = 0.35
+
+
+def match_ayah_in_stream(stream, pred_str):
+    """Best-fit alignment of an ayah's canonical phoneme stream anywhere in a
+    (diacritics-stripped) predicted stream, using the same sliding-window
+    Levenshtein rule as GuidedLiveTrie._find_span. Returns (start, end, dist)
+    or None when no alignment within the error budget exists.
+
+    Unlike the prefix trie, this can anchor a tail that starts mid-ayah, which
+    is exactly the live-advance case: the recent window begins inside the
+    previous ayah and only later covers the start of the next one.
+    """
+    target = strip_diacritics(stream)
+    body = strip_diacritics(pred_str or "")
+    win = len(target)
+    if win == 0 or not body:
+        return None
+    bound = min(len(body), max(win * 4, win + 40))
+    budget = max(1, int(win * _ADVANCE_ERR_RATE))
+    if target in body[:bound]:
+        start = body.index(target)
+        return (start, start + win, 0)
+    if len(body) >= win:
+        best = None
+        for i in range(min(bound, len(body) - win + 1)):
+            sub = body[i : i + win]
+            dist = Levenshtein.distance(sub, target)
+            if best is None or dist < best[0]:
+                best = (dist, i)
+            if dist <= budget:
+                break
+        if best and best[0] <= budget:
+            return (best[1], best[1] + win, best[0])
+        return None
+    dist = Levenshtein.distance(body, target)
+    if dist <= budget:
+        return (0, len(body), dist)
+    return None
+
+
+def advance_target(pred_str, cur_s, cur_a, allowed_surahs=None):
+    """Find the FURTHEST later ayah of surah `cur_s` whose canonical stream is
+    best-aligned anywhere within pred_str with enough anchor coverage. Returns
+    (surah_id, ayah_id, score) or None. Walking later ayahs in order and keeping
+    the last genuine match biases the answer to wherever the user has actually
+    reached (their latest decoded tokens sit at the tail of the window)."""
+    if allowed_surahs is not None and cur_s not in allowed_surahs:
+        return None
+    if not pred_str or len(strip_diacritics(pred_str)) < _ADVANCE_MIN_ANCHOR:
+        return None
+    best = None
+    for a_id in get_surah_ayah_ids(cur_s):
+        if a_id <= cur_a:
+            continue
+        stream = TAJWEED_ONLY_INDEX[cur_s][a_id]["expected_full"]
+        span = match_ayah_in_stream(stream, pred_str)
+        if span is None:
+            continue
+        start, end, dist = span
+        if end - start < _ADVANCE_MIN_ANCHOR:
+            continue
+        win = len(strip_diacritics(stream))
+        score = 1.0 - (dist / win if win else 0.0)
+        best = (cur_s, a_id, round(score, 4))
+    return best

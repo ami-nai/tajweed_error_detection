@@ -193,7 +193,7 @@ class RecitationPage extends ConsumerWidget {
                     ? _buildSurahView(recitationState)
                     : (isOpenMic
                         ? _buildOpenMicCard(recitationState)
-                        : _buildSingleAyahWrap(recitationState.words)),
+                        : _buildSingleAyahWrap(recitationState.words, recitationState.activeWordIndex)),
               ),
             ),
             const SizedBox(height: 20),
@@ -315,15 +315,15 @@ class RecitationPage extends ConsumerWidget {
     );
   }
 
-  Widget _buildSingleAyahWrap(List<WordTrackResult> words) {
+  Widget _buildSingleAyahWrap(List<WordTrackResult> words, int? activeIndex) {
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Wrap(
         spacing: 12.0,
         runSpacing: 16.0,
         alignment: WrapAlignment.center,
-        children: words.map((word) {
-          return _wordChild(word);
+        children: words.asMap().entries.map((entry) {
+          return _wordChild(entry.value, isActive: entry.key == activeIndex);
         }).toList(),
       ),
     );
@@ -372,8 +372,12 @@ class RecitationPage extends ConsumerWidget {
     final children = <Widget>[];
     for (final aId in ayahIds) {
       final words = state.surahWords[aId] ?? [];
-      for (final word in words) {
-        children.add(_wordChild(word));
+      final isDetectedAyah = aId == state.openMicAyah;
+      for (var i = 0; i < words.length; i++) {
+        children.add(_wordChild(
+          words[i],
+          isActive: isDetectedAyah && i == state.activeWordIndex,
+        ));
       }
       children.add(_ayahEndMarker());
     }
@@ -403,7 +407,7 @@ class RecitationPage extends ConsumerWidget {
     );
   }
 
-  Widget _wordChild(WordTrackResult word) {
+  Widget _wordChild(WordTrackResult word, {bool isActive = false}) {
     final Color teal = Colors.teal;
 
     // Fallback: if no letter-level data is available, color the whole word.
@@ -422,6 +426,7 @@ class RecitationPage extends ConsumerWidget {
           ),
         ),
         word.isRead,
+        isActive: isActive,
       );
     }
 
@@ -452,16 +457,22 @@ class RecitationPage extends ConsumerWidget {
         ),
       ),
       word.isRead,
+      isActive: isActive,
     );
   }
 
-  Widget _wordContainer(String semantics, Widget child, bool isRead) {
+  Widget _wordContainer(String semantics, Widget child, bool isRead, {bool isActive = false}) {
     return AnimatedContainer(
       duration: const Duration(milliseconds: 200),
       padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       decoration: BoxDecoration(
-        color: isRead ? Colors.teal.withOpacity(0.1) : Colors.transparent,
+        color: isRead
+            ? Colors.teal.withOpacity(0.1)
+            : (isActive ? Colors.amber.withOpacity(0.25) : Colors.transparent),
         borderRadius: BorderRadius.circular(4),
+        border: (isActive && !isRead)
+            ? Border.all(color: Colors.amber.shade700, width: 1.5)
+            : null,
       ),
       child: child,
     );
@@ -615,7 +626,12 @@ class RecitationPage extends ConsumerWidget {
                     spacing: 10.0,
                     runSpacing: 12.0,
                     alignment: WrapAlignment.end,
-                    children: words.map((word) => _wordChild(word)).toList(),
+                    children: words.asMap().entries.map((entry) {
+                      return _wordChild(
+                        entry.value,
+                        isActive: isCurrent && entry.key == state.activeWordIndex,
+                      );
+                    }).toList(),
                   ),
                   if (state.ayahDiffs.containsKey(aId)) ...[
                     const SizedBox(height: 4),

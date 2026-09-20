@@ -63,6 +63,11 @@ class RecitationResult {
   // Open-mic: raw decoded phoneme stream as it is produced by the server.
   final String livePhonemes;
 
+  // Live "spotlight": index of the word currently expected next, within
+  // whichever ayah is on screen (selectedAyah / currentAyah / openMicAyah).
+  // Null when nothing is active (idle, or just finalized).
+  final int? activeWordIndex;
+
   // Surah (sequential) mode fields
   final Map<int, List<WordTrackResult>> surahWords;
   final Map<int, double> ayahAccuracies;
@@ -97,6 +102,7 @@ class RecitationResult {
     this.mode = RecitationMode.singleAyah,
     this.openMicAyah,
     this.livePhonemes = '',
+    this.activeWordIndex,
     Map<int, List<WordTrackResult>>? surahWords,
     Map<int, double>? ayahAccuracies,
     this.surahAverage = 0,
@@ -159,6 +165,7 @@ class RecitationResult {
     RecitationMode? mode,
     Object? openMicAyah = _omit,
     String? livePhonemes,
+    Object? activeWordIndex = _omit,
     Map<int, List<WordTrackResult>>? surahWords,
     Map<int, double>? ayahAccuracies,
     double? surahAverage,
@@ -188,6 +195,9 @@ class RecitationResult {
           ? this.openMicAyah
           : openMicAyah as int?,
       livePhonemes: livePhonemes ?? this.livePhonemes,
+      activeWordIndex: identical(activeWordIndex, _omit)
+          ? this.activeWordIndex
+          : activeWordIndex as int?,
       surahWords: surahWords ?? this.surahWords,
       ayahAccuracies: ayahAccuracies ?? this.ayahAccuracies,
       surahAverage: surahAverage ?? this.surahAverage,

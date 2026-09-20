@@ -1,75 +1,84 @@
 # Tajweed Error Detection App (Quran Recitation Verification System)
 
-A real-time Tajweed error-detection system that listens to a user reciting a
-Quranic ayah (or a continuous surah) and gives instant, per-letter and per-word
-feedback on how accurately the recitation matched the correct phonemes.
+A real-time Tajweed error-detection and recitation follow-along system. A
+Flutter mobile app streams live microphone audio to a FastAPI + PyTorch backend
+running a fine-tuned **wav2vec2** phoneme model. The backend transcribes speech
+into phoneme strings, matches them against the correct phonemic targets of the
+Quranic text, and streams back per-word / per-letter highlighting, accuracy
+scores, and mistake feedback — live, while the user recites.
+
+Three recitation modes are supported:
+
+| Mode | What the user does | What the server does |
+|---|---|---|
+| **Single ayah** | Picks surah + ayah, recites it | Tracks that ayah word-by-word, scores it on Stop |
+| **Full surah** | Picks a surah, recites ayah by ayah | Tracks the current ayah, advances on Next/Stop per ayah |
+| **Open mic** | Picks a surah (candidate filter), recites anything | **Auto-detects which ayah is being recited**, follows across ayahs automatically |
 
 The system is the practical implementation for the **UG thesis / Tarteel
-verification** project. A Flutter mobile app streams live microphone audio to a
-FastAPI + PyTorch backend that runs a fine-tuned **wav2vec2** speech model and
-a phoneme-level evaluator.
+verification** project. Current branch: `highlight_reltime`.
 
 ---
 
-## 1. Overview and Goal
+## 1. System Architecture (VAD-free live loop)
 
-Correct Arabic recitation (Tajweed) differs from plain spoken Arabic mainly at
-the **phoneme level**: letters, harakat (short vowels / ـَ ـِ ـُ), madd (long
-vowels), heavy letters (tafkhim), and articulation details such as ghunnah
-(nasalization of نـ/ـن). The goal of this project is to build a system that:
-
-1. Records a user's recitation on a smartphone.
-2. Transcribes it into a *phoneme string* in real time.
-3. Compares that string against the *correct* phonemic target of the ayah
-   (produced by an Arabic-phonetics library).
-4. Reports whether each word and each letter/haraka was read correctly, with
-   an overall accuracy score.
-
-The current delivered system covers the memorized (short) surahs commonly used
-when learning recitation: **Al-Fatihah and the 15th–30th juz' short surahs**,
-with the app UI currently exposing Al-Masad (111) through An-Nas (114).
-
----
-
-## 2. System Architecture
+Silero VAD was removed. There is no speech segmentation anymore — audio flows
+continuously and a heartbeat loop decodes it in small beats:
 
 ```
 ┌───────────────────────────┐          WebSocket            ┌──────────────────────────────────────┐
 │  Flutter mobile app       │   ────────────────────────►   │  FastAPI backend (uvicorn)           │
-│  ─ Mic recording (16 kHz  │     ws(s)://<host>:8000      │  ─ Silero VAD (speech segmentation)   │
-│    16-bit PCM mono)       │      /ws/recite              │  ─ W2V2Light model (wav2vec2-base +  │
-│  ─ audio byte streaming   │                              │    CTC phoneme head, 39 classes)      │
-│  ─ JSON result rendering  │   ◄────────────────────────   │  ─ quran-transcript phonetizer       │
-│    (per-word + per-letter │         JSON feedback        │  ─ Levenshtein alignment / scoring    │
-│    colors, accuracy, PER) │                              │  ─ Tajweed index (18 surahs, 104 ayah)│
+│  ─ Mic recording (16 kHz  │     ws(s)://<host>:8000      │  ─ heartbeat tick every 0.5 s         │
+│    16-bit PCM mono)       │      /ws/recite              │  ─ energy gate (RMS silence skip)     │
+│  ─ audio byte streaming   │                              │  ─ W2V2Light (wav2vec2-base + CTC    │
+│  ─ JSON result rendering  │   ◄────────────────────────   │    phoneme head, 39 classes)         │
+│    (word spotlight, per-  │      JSON interim + final    │  ─ phoneme trie (detection + guided) │
+│    letter colors, live    │                              │  ─ quran-transcript phonetizer       │
+│    phoneme strip, acc/PER)│                              │  ─ Levenshtein alignment / scoring    │
 └───────────────────────────┘                              └──────────────────────────────────────┘
 ```
 
-**Key design decision:** the heavy ML model (≈370 MB, PyTorch) does *not* run on
-the phone. It runs on the backend (this machine), exposed to phones through an
-ngrok tunnel when they are not on the same LAN, and the phone only records and
-streams raw audio. This keeps the APK small and lets a single trained model
-serve all devices.
+**Key design decisions:**
+
+- The heavy ML model (≈370 MB, PyTorch) does *not* run on the phone. It runs on
+  the backend (this machine), exposed to phones through an ngrok tunnel when
+  they are not on the same LAN. The phone only records and streams raw audio.
+- Interim results stream **every heartbeat tick** (`{final:false}` messages with
+  words + spotlight + live phoneme string). The authoritative result is computed
+  once, on Stop (`{final:true}`).
+- The user's **Stop button is the only finalize path**. Connection errors tear
+  down the channel without finalizing, so a network blip can never produce a
+  mid-recite score.
 
 ---
 
-## 3. Directory Layout
+## 2. Directory Layout
 
 ```
 tajweed_detect_app/
 ├── README.md                  ← this document
-├── PROCESS.md                 ← detailed audio→phoneme→feedback pipeline notes
+├── PROCESS.md                 ← deeper audio→phoneme→matching pipeline notes
+├── DEPLOYMENT.md              ← deployment notes
+├── conversation_context.md    ← spotlight feature context (from Claude)
+├── spotlight_changes.md       ← spotlight exact-diff spec (from Claude)
 ├── start_backend.sh           ← start uvicorn + ngrok on this laptop
 ├── stop_backend.sh            ← stop uvicorn + ngrok
 │
 ├── td_backend/                ← Python FastAPI + ML backend
-│   ├── main.py                ← FastAPI app, /ws/recite endpoint, VAD loop
-│   ├── ml_engine.py           ← model, vocabulary, index, evaluation
+│   ├── main.py                ← FastAPI app, Session, heartbeat, WS endpoint
+│   ├── ml_engine.py           ← model, vocabulary, index, tries, evaluation
+│   ├── phonetic_trie.py       ← PhoneticTrie: fuzzy Levenshtein-automaton search
 │   ├── quran_metadata.json    ← corpus index (416 rows / 104 ayahs / 18 surahs)
 │   ├── quran_model_final-alif-hamja_correction.pt   ← trained checkpoint (39 classes)
-│   ├── silero_vad.jit         ← pre-trained Silero VAD model (TorchScript)
+│   ├── quran_model_final.pt   ← earlier checkpoint (kept for reference)
+│   ├── silero_vad.jit         ← REMOVED from pipeline; file kept on disk only
 │   ├── requirements.txt       ← full pinned dependency set (GPU-ready)
-│   ├── test_client.py         ← WS smoke-test client
+│   ├── requirements-colab.txt ← colab deploy deps
+│   ├── deploy_colab.py        ← stale colab deploy script (predates ngrok switch)
+│   ├── test_ws_smoke.py       ← WS smoke + unit tests (the contract — keep green)
+│   ├── test_phonetic_trie.py  ← trie unit tests
+│   ├── test_client.py         ← legacy client (predates live protocol)
+│   ├── 111-1,2.m4a            ← real 15 s recitation clip (decode experiments)
 │   └── fastapienv/            ← local Python virtual environment
 │
 └── td_frontend/               ← Flutter cross-platform app
@@ -90,368 +99,325 @@ tajweed_detect_app/
 
 ---
 
-## 4. Backend (FastAPI + PyTorch)
+## 3. Backend (FastAPI + PyTorch)
 
-### 4.1 Startup sequence (`main.py` + `ml_engine.py`)
+### 3.1 Startup sequence (`ml_engine.py`)
 
-On launch the backend, in order:
+On import, in order:
 
-1. **Loads Silero VAD** (`silero_vad.jit`) and puts it in eval mode.
-2. **Reads the trained vocabulary** from the checkpoint head: the number of
-   output classes `V_SIZE` is read directly from
-   `phoneme_head.weight.shape[0]` (currently **39** = 2 special tokens
-   `<pad>`, `<blank>` + **37 phoneme tokens**). The code adapts automatically
-   if a differently-sized checkpoint is later substituted.
-3. **Builds the Tajweed index** from `quran_metadata.json` (see §6). For every
-   ayah it pre-computes the full-ayah phoneme stream and per-word phonemes
-   once, so inference never re-phonetizes text.
-4. **Loads model weights** into `W2V2Light(V_SIZE)` (strict-load off) and
-   puts the model in eval mode.
+1. **Reads the trained vocabulary size from the checkpoint head**:
+   `V_SIZE = phoneme_head.weight.shape[0]` (currently **39** = 2 special tokens
+   `<pad>`, `<blank>` + **37 phoneme tokens**). Adapts automatically to a
+   differently-sized checkpoint.
+2. **Builds the Tajweed index** (`TAJWEED_ONLY_INDEX[surah][ayah] =
+   {words, expected_full}`) from `quran_metadata.json` using
+   `quran_transcript.quran_phonetizer` with Hafs `MoshafAttributes`
+   (ghunnah/madd lengths aligned to training) plus the **alif-hamja
+   correction** (`normalize_initial_hamzat_wasl`). Full-ayah phonetization is
+   preferred (cross-word tajweed rules preserved); per-word is the fallback.
+   Done once — inference never re-phonetizes text.
+3. **Loads weights** into `W2V2Light(V_SIZE)` and eval mode; loads the
+   `facebook/wav2vec2-base` feature extractor (first run downloads it into the
+   HuggingFace cache).
 
-### 4.2 The acoustic model — `W2V2Light`
+### 3.2 The acoustic model — `W2V2Light`
 
-```python
-class W2V2Light(nn.Module):
-    def __init__(self, v_size):
-        self.base = AutoModel.from_pretrained("facebook/wav2vec2-base")
-        self.phoneme_head = nn.Linear(768, v_size)
+Backbone `facebook/wav2vec2-base` (12 transformer layers, 768 hidden dim) + a
+single linear head to 39 classes, trained with **CTC loss** (≈one label per
+20 ms frame). CUDA if available, else CPU. A threading `_INFERENCE_LOCK`
+serializes inference because heartbeat decodes and the final eval can overlap.
+CTC frame stride is **320 samples/frame** at 16 kHz
+(`conv_stride [5,2,2,2,2,2,2]` in the wav2vec2-base config).
 
-    def forward(self, x):
-        x = self.base.feature_extractor(x).transpose(1, 2)
-        x = self.base.feature_projection(x)[0]
-        x = self.base.encoder(x).last_hidden_state
-        return self.phoneme_head(x)
-```
+### 3.3 Vocabulary (critical)
 
-- Backbone: **facebook/wav2vec2-base** (12 transformer layers, 768 hidden dim)
-  from HuggingFace `transformers`.
-- Head: a single linear layer to 39 classes — trained with **CTC loss** so it
-  aligns unsegmented audio to a phoneme label per ~20 ms frame.
-- Inference device: CUDA if available, else CPU.
+The checkpoint does **not** store token ordering; `ml_engine.py` replays the
+exact training order so head row *i* maps to the phoneme it was trained with:
 
-### 4.3 Vocabulary (critical)
-
-The model outputs one token per frame. The saved checkpoint does **not** store
-the token ordering; `ml_engine.py` reconstructs the **exact training order**
-(replayed from the training notebook's dataset build) so row *i* of the head
-maps back to the same phoneme the model was trained with:
-
-| id | token      | id | token | id | token | id | token |
+| id | token | id | token | id | token | id | token |
 |----|------------|----|-------|----|-------|----|-------|
-| 0  | `<pad>`    | 10 | ِ     | 20 | ُ     | 30 | ف     |
-| 1  | `<blank>`  | 11 | ۦ     | 21 | ك     | 31 | ج     |
-| 2  | ت          | 12 | ل     | 22 | س     | 32 | ق     |
-| 3  | َ (fatha)  | 13 | ه     | 23 | ص     | 33 | ۥ     |
-| 4  | ب          | 14 | ن     | 24 | ر     | 34 | ں     |
-| 5  | ␣ (space)  | 15 | و     | 25 | ذ     | 35 | ش     |
-| 6  | ي          | 16 | ڇ     | 26 | أ     | 36 | خ     |
-| 7  | د          | 17 | م     | 27 | ح     | 37 | ث     |
-| 8  | ا          | 18 | غ     | 28 | ة     | 38 | إ     |
+| 0  | `<pad>`    | 10 | ِ     | 20 | ُ     | 31 | ج     |
+| 1  | `<blank>`  | 11 | ۦ     | 21 | ك     | 32 | ق     |
+| 2  | ت          | 12 | ل     | 22 | س     | 33 | ۥ     |
+| 3  | َ (fatha)  | 13 | ه     | 23 | ص     | 34 | ں     |
+| 4  | ب          | 14 | ن     | 24 | ر     | 35 | ش     |
+| 5  | ␣ (space)  | 15 | و     | 25 | ذ     | 36 | خ     |
+| 6  | ي          | 16 | ڇ     | 26 | أ     | 37 | ث     |
+| 7  | د          | 17 | م     | 27 | ح     | 38 | إ     |
+| 8  | ا          | 18 | غ     | 28 | ة     |    |       |
 | 9  | ء          | 19 | ع     | 29 | ط     |    |       |
+|    |            |    |       | 30 | ف     |    |       |
 
-Phoneme set actually used (37): `ت َ ب ␣ ي د ا ء ِ ۦ ل ه ن و ڇ م غ ع ُ ك س ص
-ر ذ أ ح ة ط ف ج ق ۥ ں ش خ ث إ`. (`V_SIZE - 2 = 37` tokens are taken, in order,
-from this list, so every head row 2–38 maps to a real phoneme.)
+37 phonemes: `ت َ ب ␣ ي د ا ء ِ ۦ ل ه ن و ڇ م غ ع ُ ك س ص ر ذ أ ح ة ط ف ج ق ۥ ں ش خ ث إ`.
 
-> Note: some tokens such as `ڇ` (the ghunnah-heavy ن) and `ۦ`/`ۥ` (harakat
-> presented as separate phonemes by the phonetizer) are genuine output classes
-> of the model.
+### 3.4 Session + heartbeat (`main.py`)
 
-`MoshafAttributes` used by the phonetizer are aligned to training:
-`rewaya="hafs"`, `ghunnah=4`, `madd_monfasel_len=4`, `madd_mottasel_len=4`,
-`madd_mottasel_waqf=5`, `madd_aared_len=4`. The phonetizer also applies the
-**alif-hamja correction** (`normalize_initial_hamzat_wasl`): leading `ٱل`/`ال`
-→ `ءَ + text[1:]` and leading `ٱ`/`ا` → `ءِ + text[1:]`, matching the
-`-alif-hamja_correction` training checkpoint.
+Each `/ws/recite` connection gets a `Session`:
 
-### 4.4 WebSocket protocol — `/ws/recite`
+- `audio`: full-session `bytearray` of everything the mic sent.
+- `eval_pos`: how much audio has been decoded so far (delta = `audio[eval_pos:]`).
+- `stream_pred_raw`: cumulative decoded phoneme string (drives the live strip).
+- `feed_tail`: cumulative decoded string since the last ayah commit (detection input).
+- `openmic_ayah_start`: byte offset where the current open-mic ayah's audio begins.
 
-The whole interaction is a single WebSocket connection.
+A heartbeat task calls `tick()` every `EVAL_INTERVAL_SEC = 0.5 s`:
 
-**Client → server:**
+1. If fewer than `MIN_NEW_BYTES = 8000` (≈0.25 s) of new audio arrived, skip
+   decoding — but **still send the live interim** so the strip never freezes.
+2. Otherwise decode **only the delta** via `predict_phonemes_bytes`, append to
+   both accumulators, and run the mode logic (guided confirm / resolve /
+   stall-advance), then send an interim.
+3. Any per-beat exception is caught, logged (`⚠️ [TICK EXCEPTION]`), and never
+   kills the session. A failed `send_json` is logged and retried next beat —
+   only a receive-side disconnect closes the connection.
 
-1. One JSON text message with the target. Two modes:
-   - *Single-ayah:* `{"surah_id": 112, "ayah_id": 3}`
-   - *Full-surah (sequential):* `{"surah_id": 112}` (no `ayah_id` key)
-2. Then a continuous stream of raw **16-bit PCM, 16 kHz, mono** bytes.
+### 3.5 Energy gate (silence filter)
 
-**Server → client (single-ayah mode):** after each detected pause, one JSON:
+Before decoding a delta, its RMS amplitude is checked against
+`ENERGY_RMS_THRESHOLD = 150` (16-bit PCM; speech is typically 500+, idle-mic
+silence far below 100). Below-threshold beats skip the model entirely — no
+hallucinated junk phonemes into the strip or `feed_tail` — while the interim,
+stall bookkeeping, and detection flow continue with an empty token batch.
+Transitions are logged (`🔇 silence beat` / `🔊 decoding resumed`), not every
+beat. This replaced Silero VAD: it only *gates*, which covers the easy most of
+the silence problem at zero model cost (see §9 on why VAD is not the accuracy
+fix).
 
-```json
-{
-  "mode": "single",
-  "ayah_id": 3,
-  "words": [ {"text": "لَمْ", "is_read": true, "letters": [{"ch":"ل","status":"ok"}, ...]}, ... ],
-  "real_text": "لَمْ يَلِدْ وَلَمْ يُولَدْ",
-  "expected":  "<full-ayah phoneme string>",
-  "predicted": "<decoded phoneme string from the model>",
-  "accuracy": 82.86,
-  "per": 17.14,
-  "diff": [ {"e": "ل", "h": "ل", "status": "M"}, ... ],
-  "mistakes": ["In «يَلِدْ», you said «ل» instead of «ن»."]
-}
-```
+### 3.6 Inference pipeline
 
-**Server → client (surah mode):**
+`_bytes_to_prediction(bytes)` = `_infer_pred_ids` → `_collapse_pred_ids`:
 
-1. Immediately after a pause is detected (before slow inference), a fast
-   **advance** message so the UI can prompt the next ayah without waiting:
-   `{"mode":"surah", "advance": true, "read_now": 2, "finished": false}`
-2. Then the evaluated-result message:
-   `{"mode":"surah", "current_ayah": 1, "next_ayah": 2, "ayah_order": [1..N],
-   "words": [ [word list of ayah 1], ... ], "ayah_accuracies": {...},
-   "surah_average": 85.5, "ayah_pers": {...}, "surah_per": 14.5,
-   "diff": [...], "expected": "...", "predicted": "...", "mistakes": [...],
-   "finished": false}`
-3. After the last ayah: `{"mode":"surah", "finished": true}`.
+1. int16 PCM → float32 waveform → 4800-sample trailing zero-pad →
+   `AutoFeatureExtractor("facebook/wav2vec2-base")` → model forward → argmax
+   per frame → raw id list (`_infer_pred_ids`; no printing, reusable for
+   windowed decoding).
+2. **CTC decode** (`_collapse_pred_ids`, matches training notebook): collapse
+   adjacent duplicates first (preserves madd/long vowels), skipping `<pad>`,
+   `<blank>`, `<dummy_pad_*>`. Result is one flat phoneme string — deliberately
+   *not* word-segmented.
 
-### 4.5 Voice activity detection (VAD)
+### 3.7 The two tries
 
-- Silero VAD is run on the **trailing 1024 samples (64 ms)** of the
-  accumulating audio buffer.
-- A frame is "speech" if `speech_prob > SILENCE_PROB_THRESHOLD (0.5)`.
-- A **pause** is declared when 15 consecutive frames are silent while the user
-  was speaking (`PAUSE_FRAME_THRESHOLD = 15`; per source comment ≈0.45–0.9 s),
-  intended to separate ayah boundaries during continuous surah recitation.
-- On every pause the backend writes the accumulated raw PCM bytes to a temp
-  file and evaluates the whole segment, then clears the buffer.
+`phonetic_trie.py` — `TrieNode{children, end, surah_id, ayah_id, word_idx,
+ayahs}` where `ayahs` is the set of every ayah passing through the node (shared
+prefixes attribute to all users). `search_fuzzy` is a bounded Levenshtein
+automaton over the trie: DP edit-distance rows carried down the tree, branches
+pruned past `budget = max(2, 35% of query)`, depths restricted to
+`[0.7×, 1.4×]` query length, normalized `score = cost / max(len, depth)`,
+rejected if `score > 0.35` or the top two candidates are within margin
+(ambiguous = keep listening).
 
-### 4.6 Inference pipeline (`_predict_phonemes`)
+- **Global ayah trie** (detection): every ayah's full `expected_full` stream
+  inserted once. `resolve_ayah(pred_str, surahs)` returns
+  `(surah, ayah, cost, score, depth)` or `None`.
+- **GuidedLiveTrie** (per-ayah highlighting): built from the tracked ayah's word
+  targets (in-vocab phonemes, diacritics stripped). `feed()` appends decoded
+  tokens to a tail; `confirm()` monotonically locks the next unread word via
+  exact-substring-then-sliding-Levenshtein span search and emits
+  `{index, text, is_read, letters}` with per-consonant `ok`/`miss` from a
+  traceback alignment. `active_index` exposes the current pointer read-only
+  (the word **spotlight** — no state mutation).
 
-1. Raw PCM bytes → `np.float32 / 32768.0` waveform.
-2. Feature extraction with `AutoFeatureExtractor("facebook/wav2vec2-base")`
-   (plus a 4800-sample trailing zero-pad) → `input_values`.
-3. Model forward → logits per frame, `argmax` → predicted token IDs.
-4. **CTC decode** (matches the notebook): collapse consecutive duplicate
-   tokens first (this preserves long madd as a repeated-then-collapsed
-   pattern as trained), skipping `<pad>`, `<blank>` and any `<dummy_pad_*>`.
-5. Result is one **flat phoneme string**, e.g. `تَبَت يَدَا ءَبِۦ لَهَبِن وَتَبڇ`
-   — the model output is deliberately *not* word-segmented.
+### 3.8 Open-mic detection + advance
 
-### 4.7 Word matching & letter scoring (`evaluate_audio`)
+- **First detection**: once `feed_tail` holds `≥ MIN_RESOLVE_TOKENS (5)` clean
+  tokens, `resolve_ayah` runs each tick until an ayah wins → `_commit_openmic`:
+  seeds `session_words`, builds the guided trie, replays `feed_tail` through it
+  (catches already-spoken words), clears the tail. Before detection, a
+  live-only interim (`{live}`) streams every tick.
+- **Advance**: after `STALL_ADVANCE_TICKS = 3` beats with no new confirmation,
+  `_maybe_advance_openmic` re-resolves on a **recent window**
+  (`max(40, 2× current ayah length)` tokens — the full tail would just re-match
+  the old ayah), trims the stale prefix regardless, and commits only on a
+  strictly-later ayah. `openmic_ayah_start` marks the new ayah's audio start.
+- Forward-guard (same/backward never advances) and a resolve cooldown prevent
+  thrash. All covered by unit tests in `test_ws_smoke.py`.
 
-Each stored target word is matched **inside** the flat prediction:
+### 3.9 WebSocket protocol — `/ws/recite`
 
-1. The word's phonemes are filtered to in-vocabulary tokens, and diacritics are
-   stripped for the consonant comparison (`ا ى` etc. are normalized).
-2. **Exact substring** of the consonant-only target in the consonant-only
-   prediction → word read.
-3. Else **sliding-window Levenshtein**: scan every window of equal length in
-   the prediction; the word counts as read if edit distance
-   `<= max(1, 0.35 × target_len)`.
-4. If the prediction is shorter than the target, a whole-string distance with
-   a 0.4 threshold is used.
-5. For read words, a Levenshtein **alignment with traceback**
-   (`_align_with_ops`) marks each consonant as `ok`/`miss`; unread words mark
-   all consonants `miss`. Diacritics and out-of-vocabulary letters are rendered
-   `neutral` (the model simply cannot emit them — see §8).
+Client → server: one JSON metadata (`{"mode","surah_id"[, "ayah_id"]}`; open-mic
+`surah_id` only narrows candidates), then raw PCM bytes, then `{"type":"stop"}`
+or `{"type":"next"}` (surah).
 
-### 4.8 Metrics returned
+Server → client interims (`final:false`, every tick when active):
 
-All computed in Python on the **full phoneme streams** (harakat included):
+- single: `{mode, ayah_id, words, active_index}`
+- surah: `{mode, current_ayah, next_ayah, ayah_order, words, active_index}`
+- open_mic: `{mode, detected{s surah_id, ayah_id}, ayah_id, words, live, active_index}`
+  (pre-detection: `{mode:"open_mic", final:false, live}` only)
 
-- `per` (**Phoneme Error Rate**) = `edit_distance(predicted, expected) / len(expected) × 100`.
-- `accuracy` = `max(0, 100 − PER)` (percentage of phonemes matched).
-- `diff`: per-character alignment list with status per position —
-  `M` match, `S` substitution, `D` deletion, `I` insertion.
-- `mistakes`: plain-text, human-readable sentences (see `_build_mistakes`),
-  e.g. `In «يَلِدْ», you said «ل» instead of «ن».`,
-  `You didn't recite the word «أَحَدٌ» correctly.`
+Server → client finals (`final:true`, on Stop/Next): full `evaluate_audio`
+scoring — `words` with letters, `real_text/expected/predicted`, `accuracy`,
+`per`, `diff` (M/S/D/I alignment), `mistakes`. Open-mic finalizes only the
+segment since `openmic_ayah_start`. Finals carry no `active_index`.
 
-The frontend additionally computes its own normalized word-level matching
-(ألف/آ/أ→ا, ى/ي→ي, ة/ه→ه) to decide word highlight colors robustly.
+### 3.10 Word matching, letter scoring, metrics
 
----
-
-## 5. Frontend (Flutter)
-
-### 5.1 Tech stack
-
-- **Flutter** (Material 3, `useMaterial3: true`, seed color teal).
-- **Riverpod** (`Notifier`/`NotifierProvider`) for all state.
-- `record` → live microphone streaming (16 kHz, 16-bit PCM, mono).
-- `web_socket_channel` → WebSocket transport to the backend.
-
-### 5.2 State & data flow
-
-- `recitation_provider.dart` holds the single `RecitationResult` state machine
-  (`idle → recording → success / retry / error`).
-- User taps **Start** → `RecitationRemoteDataSource.startStreamingRecording()`
-  opens the WS, sends the metadata JSON (`{"surah_id":…, "ayah_id":…}` or
-  `{"surah_id":…}` for surah mode), then pipes raw PCM mic bytes into the
-  socket.
-- Incoming JSON is parsed into `RecitationResult` and rendered.
-- `quranTextDatabase` (in `recitation_provider.dart`) is the local static copy
-  of the ayah texts for the 4 surahs shown in the UI (111–114), used to
-  initialize word chips before the first server result arrives.
-
-### 5.3 Backend URL configuration
-
-The backend URL is a compile-time define:
-
-```dart
-const String kBackendUrl = String.fromEnvironment(
-  'BACKEND_URL',
-  defaultValue: 'ws://192.168.1.113:8000',   // local dev default
-);
-```
-
-Override at build/run time with
-`--dart-define=BACKEND_URL=wss://<host>` (see §7.3).
-
-### 5.4 UI features (`recitation_page.dart`)
-
-- **Mode toggle:** `Single Ayah` / `Full Surah` (ChoiceChips, disabled while
-  recording).
-- **Selector card:** Surah dropdown (Al-Masad 111, Al-Ikhlas 112, Al-Falaq 113,
-  An-Nas 114) and, in single-ayah mode, an Ayah dropdown (boundaries per surah).
-- **Start / Stop** buttons.
-- **Quran Text card** (RTL, Amiri font):
-  - *Single ayah:* each ayah word rendered as a chip; read words turn teal
-    with a tinted background.
-  - *Letter-level colors:* `ok` → teal, `miss` → red, `neutral` → black.
-  - *Full surah:* each ayah in its own bordered block, current ayah highlighted
-    with a teal border and a **"▶ Read now"** badge; per-ayah summary chips
-    show `Acc X%` and `PER X%`.
-- **Results card:**
-  - Accuracy (color-coded: ≥70 teal, ≥40 orange, else red) and PER.
-  - **Real transcription** and **Predicted transcription** rendered from the
-    alignment `diff` (matched chars teal, mismatches red).
-  - Expandable **"Show mistakes"** list of plain-text error sentences.
-  - In surah mode: Surah Average Accuracy, Surah PER, current/next ayah, and
-    per-ayah expandable transcriptions + mistakes.
-- **Status banner:** shows a friendly error if the backend is unreachable
-  (with the configured `kBackendUrl`), or "Reciting…" while streaming.
-
-### 5.5 Android permissions
-
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-<uses-permission android:name="android.permission.RECORD_AUDIO" />
-```
+`evaluate_audio` matches each target word inside the flat prediction (exact
+consonant substring, else sliding-window Levenshtein ≤ 35%, else whole-string
+≤ 40%), then traceback-aligns read words to `ok`/`miss` per consonant.
+Diacritics and out-of-vocab letters render `neutral`; mistake sentences are
+emitted **only for model-verifiable characters** (`_is_feedback_char`) so the
+system never fabricates errors on marks it cannot output (sukun, shadda,
+tanween, ظ ض ز, …). `PER = edit_dist/len(expected)×100`,
+`accuracy = max(0, 100−PER)`.
 
 ---
 
-## 6. Corpus / Tajweed Index (`quran_metadata.json`)
+## 4. Frontend (Flutter)
 
-- **416 rows** of ayah metadata.
-- **104 unique ayahs** (the indexer keeps the last row per `(surah_id, ayah_id)`)
-  across **18 surahs**:
+### 4.1 Stack & data flow
 
-  ```
-  1 (Al-Fatihah), 94, 95, 97, 99, 102, 103, 104, 105, 106, 107, 108,
-  109, 110, 111, 112, 113, 114
-  ```
+Flutter + Material 3, Riverpod `Notifier`, `record` mic streaming (PCM16 /
+16 kHz / mono), `web_socket_channel`. `kBackendUrl` is a `--dart-define`
+(`BACKEND_URL`, LAN default); `quranTextDatabase` in the provider seeds static
+word chips before server data arrives.
 
-- Each row includes: `surah_id`, `ayah_id`, `surah_name_ar/en/tr`, `ayah_count`,
-  `ayah_ar/en/tr`, `reciter_id`, `reciter_name`, `audio` (URL), and
-  `local_audio_path`.
-- **4 reciters** contribute the recordings:
-  `Husary_Mujawwad_64kbps`, `warsh_yassin_64kbps`, `Ghamadi_40kbps`,
-  `Minshawy_Teacher_128kbps`.
+Start → datasource opens WS, sends metadata, pipes mic bytes in; provider
+listens: payload handler is sandboxed (a malformed message is logged and
+ignored, never tears down the stream); `onError` calls `abortStreaming()`
+(mic + channel torn down **without** sending `stop`, so errors never
+auto-finalize); `onDone`/15 s fallback go idle. The Stop button's `stop`
+is the only finalize trigger; `forceClose` is the no-reply fallback.
 
-The backend index (`TAJWEED_ONLY_INDEX`) therefore supports all 18 surahs even
-though the current app dropdown intentionally exposes the four gradated
-memorization surahs (111–114).
+### 4.2 Provider logic (`recitation_provider.dart`)
+
+- **single interim**: OR-merge server words/letters into local words; apply
+  `active_index`.
+- **surah**: rebuild per-ayah word maps from `ayah_order`; interim applies the
+  spotlight, finals replace + clear it (`active_index: null`).
+- **open_mic**: `detected` updates selection (+reseeds the surah map on surah
+  change); first detection seeds wholesale; a later ayah **replaces** state and
+  clears metrics (forward advance); otherwise OR-merge; `live` → `livePhonemes`
+  (absent key keeps previous); final → wholesale replace + `success`.
+- Resets: mode/ayah/start-reciting set the spotlight (`0` for single/surah,
+  `null` for pre-detection open-mic); teardown paths clear it. Sentinel
+  `copyWith` (`_omit`) distinguishes "set null" from "unchanged".
+
+### 4.3 UI (`recitation_page.dart`)
+
+- Mode toggle (Single / Full Surah / Open Mic), surah+ayah selectors, Start/Stop.
+- **Open-mic card**: the whole surah as one continuous RTL word flow with a teal
+  `۝` ayah-end marker, plus the **Live Predicted Phonemes** strip (Amiri font).
+- **Word spotlight** (all modes): the word at `activeWordIndex` gets an amber
+  wash + border; read words are teal with per-letter `ok/miss/neutral` colors.
+- Results card: accuracy + PER, alignment-colored real/predicted
+  transcriptions, expandable mistakes; surah mode adds per-ayah blocks, badges
+  (`▶ Read now`), and surah averages.
 
 ---
 
-## 7. How to Run
+## 5. Corpus / Tajweed Index
 
-### 7.1 Backend (local, with GPU or CPU)
+`quran_metadata.json`: 416 rows → **104 ayahs across 18 surahs**
+(1, 94, 95, 97, 99, 102–114), 4 reciters. The backend index supports all 18;
+the app dropdown exposes the graded memorization surahs (111–114).
 
-Prerequisites in `td_backend/`: `quran_metadata.json`,
-`quran_model_final-alif-hamja_correction.pt`, `silero_vad.jit`, plus the
-packages in `requirements.txt` (a ready local env `fastapienv/` is included).
+---
 
-```bash
-cd td_backend
-./fastapienv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
-```
+## 6. How to Run
 
-- `--host 0.0.0.0` lets phones on the same LAN connect.
-- First run downloads `facebook/wav2vec2-base` into the HuggingFace cache.
-- Interactive docs: `http://localhost:8000/docs`.
-
-### 7.2 Backend + ngrok tunnel on this laptop (one command)
+### 6.1 Backend + ngrok (one command, from repo root)
 
 ```bash
 ./start_backend.sh     # starts uvicorn + ngrok, prints the public wss:// URL
 ./stop_backend.sh      # stops both
 ```
 
-### 7.3 Frontend (Flutter)
+Model load takes ~3 min CPU before `:8000` serves; docs at
+`http://localhost:8000/docs`. Backend log: `/tmp/opencode/uvicorn.log`.
+
+> Memory rule: **stop uvicorn before running the smoke suite** — two model
+> copies (server + test process) thrash swap and hang the run.
+
+### 6.2 Frontend
 
 ```bash
-cd td_frontend
-flutter pub get
-
-# Local device (phone + PC on same network)
-flutter run --dart-define=BACKEND_URL=ws://<PC_LAN_IP>:8000
-
-# Release APK pointed at the public backend (ngrok tunnel)
-flutter build apk --release --dart-define=BACKEND_URL=wss://<host>.ngrok-free.app
-# output: build/app/outputs/flutter-apk/app-release.apk
+cd td_frontend && flutter pub get
+flutter run --dart-define=BACKEND_URL=ws://<PC_LAN_IP>:8000        # LAN dev
+flutter build apk --release --dart-define=BACKEND_URL=wss://<host> # via tunnel
 ```
 
-### 7.4 Backend smoke test
+### 6.3 Tests (the contract — keep green)
 
 ```bash
-cd td_backend && ./fastapienv/bin/python test_client.py
+cd td_backend && ./fastapienv/bin/python test_ws_smoke.py   # uvicorn STOPPED
+./fastapienv/bin/python test_phonetic_trie.py
+cd ../td_frontend && flutter analyze                        # 0 errors
 ```
 
-(`test_client.py` connects to `ws://127.0.0.1:8000/ws/recite`, sends metadata
-for Surah 112 / Ayah 3 plus a WAV file, and prints the JSON result.)
+`test_ws_smoke.py` covers the live WS protocol (single/open-mic/surah) plus
+advance units (forward-guard, cooldown, first-commit marker, windowed
+resolve+trim, stall-trigger) and resilience units (low-bytes-live,
+predict-error survival, send-failure survival, pre-detection streaming,
+silence-gate). Zero-filled PCM fixtures are pure silence by definition, so any
+test that needs decode to run uses the deterministic `_noise_bytes` helper
+(RMS 500) — swapping those back to zeros silently un-tests them.
 
 ---
 
-## 8. Evaluation Metrics (Thesis notes)
+## 7. Live-decode quality: what the experiments showed
 
-| Metric              | Definition                                                      | Where computed |
-|---------------------|-----------------------------------------------------------------|----------------|
-| **Accuracy**        | `max(0, 100 − PER)` — % of phonemes matched                      | backend        |
-| **PER**             | `edit_distance(pred, expected) / len(expected) × 100`            | backend        |
-| **Word hit**        | Target word phonemes found in predicted stream (substring or ≤35% edit-distance window) | backend |
-| **Letter status**   | per-consonant `ok`/`miss` from Levenshtein alignment; `neutral` for model-unverifiable chars | backend |
-| **diff**            | per-position `M`/`S`/`D`/`I` alignment (drives colored transcription) | backend |
+On a real 15 s clip of 111:1–2 (`td_backend/111-1,2.m4a`), scored by
+Levenshtein distance to `expected_full` ground truth (lower = better):
 
-The model can only emit the 37 tokens of its vocabulary, so the feedback layer
-deliberately reports mistakes **only for characters the model was trained on**
-(`_is_feedback_char`); marks such as sukun (ْ), shadda (ّ), tanween (ًٌٍ),
-maddah (ٓ), superscript alif (ٰ) and out-of-vocabulary consonants (ظ، ض، ز)
-are never asserted as mistakes — this prevents fabricating errors the model
-cannot verify.
+| Decode strategy | Dist | Note |
+|---|---|---|
+| One-shot full clip (old VAD-segment quality) | **24** | model ceiling on this clip |
+| Stitched 0.5 s deltas = current live strip | **62** | fragmentation destroys it |
+| 3 s windows, naive frame crop | 43 | — |
+| 3 s windows + LEAD lookahead + collapse carry | **29** | full Phase A design |
 
----
+Conclusions: (1) the strip's inaccuracy is ~3× worse than the model ceiling and
+almost entirely a **framing** problem, not a model or CPU problem — CPU vs GPU
+computes the same argmax, only faster; (2) naive window stitching is not
+enough — the LEAD lookahead (never emit pad-adjacent frames) and the
+cross-slice collapse `prev` carryover are both load-bearing; (3) VAD can only
+ever *gate*, never improve a decode — it is not the fix (see §3.5).
 
-## 9. Known Limitations & Current Status
-
-1. **Chunked, not word-streamed.** The model evaluates the whole utterance
-   between VAD pauses — feedback appears after you pause, not letter-by-letter
-   while speaking.
-2. **Recognition is data-dependent.** It is most accurate on reciters/surahs
-   similar to the training data; unseen reciters may misrecognize.
-3. **Training scale.** The current checkpoint was trained on a small set of
-   short surahs (~81 usable samples after filtering; ~220 collected rows).
-   Larger-tablet retraining is the recommended accuracy improvement.
-4. **Mistake-list coverage.** `_build_mistakes` returns an empty list when the
-   phonetizer merges words across boundaries (full-stream spacing does not
-   equal word count), e.g. Al-Ikhlas ayah 4 — those ayahs then show no
-   "Show mistakes" button (the diff/transcriptions still appear).
-5. **UI surahs.** Backend index covers 18 surahs; the app dropdown currently
-   exposes 4 (111–114).
-6. **Vocabulary fixed during inference.** The deployed checkpoint has 39
-   classes (2 special + 37 phonemes, no letter ى). Should a future retrained
-   checkpoint change `V_SIZE`, `ml_engine.py` adapts automatically and the
-   vocab is taken from the ordered `TRAINED_PHONEMES` list.
+**Roadmap — Phase A (LANDED):** production windowed decode is live on the tick
+path (`decode_live_window` in `ml_engine.py`, wired into `_tick_once` in
+`main.py`): trailing 3 s window (`LIVE_WINDOW_SAMPLES`), frame-index slicing
+with stride computed from the loaded model (`CTC_STRIDE`, never hardcoded),
+16-frame LEAD lookahead (`LIVE_LEAD_FRAMES`), and cross-slice collapse
+carryover (`_win_prev`, reset on silence-gated beats so repeats after a pause
+are not merged). Finals untouched; interim payload shape unchanged (no
+frontend changes needed). Measured cost ≈2.3 s per window on this CPU, so the
+live cadence is accurate chunks every ~2.5–3 s (self-throttled, no backlog)
+rather than 0.5 s-smooth — the available knob is window size (2 s windows ≈
+2 s cadence). Cloud GPU was evaluated and deferred: it buys smoothness, never
+accuracy — revisit only if post-Phase-A cadence feels too slow after free CPU
+optimizations (thread tuning, quantization/ONNX).
 
 ---
 
-## 10. Related Documents
+## 8. Known Limitations & Status
 
-- **PROCESS.md** — deeper notes on the audio→phoneme→matching pipeline.
-- Training notebook (referenced by `ml_engine.py`): the dataset build and CTC
-  training/decode were performed in a separate **problamalif.ipynb** notebook;
-  `TRAINED_PHONEMES` order, `MoshafAttributes`, and the CTC decode in the code
-  are kept in lock-step with that notebook.
+1. **Live strip framing (being fixed).** Until Phase A lands, the strip is
+   stitched 0.5 s deltas — visibly worse than finals. Finals are unaffected
+   (full-segment one-shot decode).
+2. **Recognition is data-dependent.** Best on reciters/surahs near the training
+   distribution.
+3. **Training scale.** Small short-surah set; retraining is the accuracy lever
+   once framing is fixed.
+4. **Mistake-list coverage.** Empty when the phonetizer merges words across
+   boundaries (diff/transcriptions still appear).
+5. **CPU cadence.** ~1 s effective live cadence today; ~2.5–3 s accurate chunks
+   after Phase A on this box (see §7).
+6. **Stale files.** `deploy_colab.py` predates the ngrok switch;
+   `test_client.py` predates the live protocol; `silero_vad.jit` is unused.
+7. **Checkpoint swap.** A retrained checkpoint with different `V_SIZE` is picked
+   up automatically; the ordered `TRAINED_PHONEMES` list must still match its
+   training order.
+
+---
+
+## 9. Related Documents
+
+- **PROCESS.md** — deeper audio→phoneme→matching pipeline notes.
+- **DEPLOYMENT.md** — deployment notes.
+- **conversation_context.md / spotlight_changes.md** — word-spotlight feature
+  specs (Tarteel-style follow-along, all three modes).
+- Training notebook (referenced by `ml_engine.py`): dataset build + CTC
+  training/decode in **problamalif.ipynb**; `TRAINED_PHONEMES` order,
+  `MoshafAttributes`, and the CTC decode stay in lock-step with it.

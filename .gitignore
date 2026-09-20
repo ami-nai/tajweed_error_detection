@@ -48,6 +48,14 @@
 **/lib/generated_plugin_registrant.dart
 
 # ==========================================
+# Session / scratch files (not for GitHub)
+# ==========================================
+conversation_context.md
+spotlight_changes.md
+.opencode/
+*.m4a
+
+# ==========================================
 # Global / OS / IDEs
 # ==========================================
 .DS_Store

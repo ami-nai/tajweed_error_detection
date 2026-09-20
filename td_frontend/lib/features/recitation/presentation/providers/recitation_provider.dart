@@ -156,6 +156,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         openMicAyah: null,
         livePhonemes: '',
         surahWords: _seedSurahWords(state.selectedSurah),
+        activeWordIndex: null,
       );
       _clearAyahMetrics();
     }
@@ -176,6 +177,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         openMicAyah: null,
         livePhonemes: '',
         surahWords: _seedSurahWords(surahId),
+        activeWordIndex: null,
       );
       _clearAyahMetrics();
     }
@@ -189,6 +191,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       status: RecitationStatus.idle,
       mode: RecitationMode.singleAyah,
       words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
+      activeWordIndex: 0,
     );
   }
 
@@ -213,6 +216,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       ayahPER: {},
       surahPER: 0,
       diff: [],
+      activeWordIndex: 0,
     );
   }
 
@@ -231,10 +235,11 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         state = state.copyWith(
           status: RecitationStatus.recording,
           words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
+          activeWordIndex: 0,
         );
       } else if (state.mode == RecitationMode.surah) {
         _loadSurah(surahId);
-        state = state.copyWith(status: RecitationStatus.recording);
+        state = state.copyWith(status: RecitationStatus.recording, activeWordIndex: 0);
       } else {
         // Open Mic: words are seeded once the server detects an ayah; the full
         // surah is already on screen and highlighting follows detection.
@@ -244,6 +249,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           openMicAyah: null,
           livePhonemes: '',
           surahWords: _seedSurahWords(surahId),
+          activeWordIndex: null,
         );
         _clearAyahMetrics();
       }
@@ -266,14 +272,24 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         },
         onError: (error) {
           print("❌ [STREAM ERROR] The server stream emitted an error: $error");
-          state = state.copyWith(status: RecitationStatus.error);
+          state = state.copyWith(
+            status: RecitationStatus.error,
+            activeWordIndex: null,
+          );
           // Tear down the broken channel WITHOUT sending a 'stop' (a 'stop' here
           // would finalize mid-recite). The Stop button is the only finalize path.
-          ref.read(dataSourceProvider).abortStreaming();
+          try {
+            ref.read(dataSourceProvider).abortStreaming();
+          } catch (teardownError) {
+            print("❌ [TEARDOWN ERROR] abortStreaming failed: $teardownError");
+          }
         },
         onDone: () {
           print("🔌 [STREAM CLOSED] The server connection closed down automatically (onDone).");
-          state = state.copyWith(status: RecitationStatus.idle);
+          state = state.copyWith(
+            status: RecitationStatus.idle,
+            activeWordIndex: null,
+          );
         }
       );
     } catch (e) {
@@ -353,6 +369,13 @@ class RecitationNotifier extends Notifier<RecitationResult> {
 
       final isFinished = data['finished'] == true;
       final nextAyah = (data['next_ayah'] as num?)?.toInt() ?? 0;
+      // active_index only rides on interim payloads (_send_interim); final
+      // messages (do_next/do_stop) carry none, so a finalized ayah clears
+      // the spotlight rather than leaving it stuck on a stale index.
+      final rawActive = data['active_index'];
+      final int? activeIdx = isFinal
+          ? null
+          : (rawActive is num ? rawActive.toInt() : state.activeWordIndex);
       // Per-ayah transcriptions (only update when the message carries them).
       final ayahDiffs = Map<int, List<DiffHit>>.from(state.ayahDiffs);
       final ayahExpected = Map<int, String>.from(state.ayahExpected);
@@ -384,6 +407,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         ayahExpected: ayahExpected,
         ayahPredicted: ayahPredicted,
         ayahMistakes: ayahMistakes,
+        activeWordIndex: activeIdx,
       );
       print("📈 [SURAH STATE] avg=${state.surahAverage} current=${state.currentAyah}");
     } else {
@@ -430,6 +454,8 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           per: (data['per'] as num?)?.toDouble() ?? state.per,
           diff: data.containsKey('diff') ? _parseDiff(data['diff']) : state.diff,
           mistakes: (data['mistakes'] as List?)?.map((e) => e.toString()).toList() ?? state.mistakes,
+          // Finalized: nothing left to spotlight.
+          activeWordIndex: null,
         );
       } else if (isOpenMic) {
         // Live per-ayah highlight as the server detects/progresses.
@@ -444,6 +470,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
             openMicAyah: detectedAyah,
             surahWords: mergedSurahWords,
             livePhonemes: liveStream ?? state.livePhonemes,
+            activeWordIndex: (data['active_index'] as num?)?.toInt() ?? 0,
           );
           return;
         }
@@ -469,6 +496,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
             per: 0,
             diff: [],
             mistakes: [],
+            activeWordIndex: (data['active_index'] as num?)?.toInt() ?? 0,
           );
           return;
         }
@@ -480,10 +508,14 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           words: merged,
           surahWords: mergedSurahWords,
           livePhonemes: liveStream ?? state.livePhonemes,
+          activeWordIndex: (data['active_index'] as num?)?.toInt() ?? state.activeWordIndex,
         );
       } else {
         // Single-ayah interim: OR-merge words/letters only.
-        state = state.copyWith(words: _mergeServerWords(state.words, serverWords));
+        state = state.copyWith(
+          words: _mergeServerWords(state.words, serverWords),
+          activeWordIndex: (data['active_index'] as num?)?.toInt() ?? state.activeWordIndex,
+        );
       }
     }
   }
@@ -541,7 +573,10 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         await ref.read(dataSourceProvider).forceClose();
       } catch (_) {}
       if (state.status == RecitationStatus.recording) {
-        state = state.copyWith(status: RecitationStatus.idle);
+        state = state.copyWith(
+          status: RecitationStatus.idle,
+          activeWordIndex: null,
+        );
       }
     });
   }
