@@ -13,6 +13,7 @@ class RecitationPage extends ConsumerWidget {
     final notifier = ref.read(recitationProvider.notifier);
 
     final bool isSurahMode = recitationState.mode == RecitationMode.surah;
+    final bool isOpenMic = recitationState.mode == RecitationMode.openMic;
 
     // Dynamic Ayah boundary lookup based on current selection configurations
     final int maxAyahs = recitationState.selectedSurah == 111
@@ -39,23 +40,31 @@ class RecitationPage extends ConsumerWidget {
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
+                child: Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 12,
+                  runSpacing: 8,
                   children: [
                     ChoiceChip(
                       label: const Text('Single Ayah'),
-                      selected: !isSurahMode,
+                      selected: !isSurahMode && !isOpenMic,
                       onSelected: recitationState.status == RecitationStatus.recording
                           ? null
                           : (_) => notifier.setMode(RecitationMode.singleAyah),
                     ),
-                    const SizedBox(width: 12),
                     ChoiceChip(
                       label: const Text('Full Surah'),
                       selected: isSurahMode,
                       onSelected: recitationState.status == RecitationStatus.recording
                           ? null
                           : (_) => notifier.setMode(RecitationMode.surah),
+                    ),
+                    ChoiceChip(
+                      label: const Text('Open Mic (Auto)'),
+                      selected: isOpenMic,
+                      onSelected: recitationState.status == RecitationStatus.recording
+                          ? null
+                          : (_) => notifier.setMode(RecitationMode.openMic),
                     ),
                   ],
                 ),
@@ -87,7 +96,7 @@ class RecitationPage extends ConsumerWidget {
                               if (value != null) notifier.updateSelection(value, 1);
                             },
                     ),
-                    if (!isSurahMode)
+                    if (!isSurahMode && !isOpenMic)
                       DropdownButton<int>(
                         value: recitationState.selectedAyah,
                         items: List.generate(maxAyahs, (index) => index + 1)
@@ -111,8 +120,10 @@ class RecitationPage extends ConsumerWidget {
             const SizedBox(height: 16),
 
             // Start / Stop control buttons (below surah/ayah selection)
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 12,
+              runSpacing: 8,
               children: [
                 ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(
@@ -123,17 +134,33 @@ class RecitationPage extends ConsumerWidget {
                   ),
                   icon: const Icon(Icons.mic, color: Colors.white, size: 18),
                   label: Text(
-                    isSurahMode ? 'Start Surah' : 'Start',
+                    isSurahMode
+                        ? 'Start Surah'
+                        : (isOpenMic ? 'Start Open Mic' : 'Start'),
                     style: const TextStyle(color: Colors.white, fontSize: 14),
                   ),
                   onPressed: recitationState.status == RecitationStatus.recording
                       ? null
                       : () => notifier.startReciting(
                             surahId: recitationState.selectedSurah,
-                            ayahId: isSurahMode ? null : recitationState.selectedAyah,
+                            ayahId: isSurahMode || isOpenMic ? null : recitationState.selectedAyah,
                           ),
                 ),
-                const SizedBox(width: 12),
+                if (isSurahMode) ...[
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.indigo,
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    icon: const Icon(Icons.skip_next, color: Colors.white, size: 18),
+                    label: const Text('Next', style: TextStyle(color: Colors.white, fontSize: 14)),
+                    onPressed: recitationState.status != RecitationStatus.recording
+                        ? null
+                        : () => notifier.nextAyah(),
+                  ),
+                ],
                 ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.redAccent,
@@ -164,7 +191,9 @@ class RecitationPage extends ConsumerWidget {
                 ),
                 child: isSurahMode
                     ? _buildSurahView(recitationState)
-                    : _buildSingleAyahWrap(recitationState.words),
+                    : (isOpenMic
+                        ? _buildOpenMicCard(recitationState)
+                        : _buildSingleAyahWrap(recitationState.words)),
               ),
             ),
             const SizedBox(height: 20),
@@ -269,7 +298,11 @@ class RecitationPage extends ConsumerWidget {
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
-                  isSurahMode ? 'Reciting Surah... wait for the pause between ayahs.' : 'Reciting...',
+                  isSurahMode
+                      ? 'Reciting Surah... tap Next after each ayah.'
+                      : (isOpenMic
+                          ? 'Listening... full surah shown; highlighting follows your recitation.'
+                          : 'Reciting...'),
                   textAlign: TextAlign.center,
                   style: const TextStyle(color: Colors.teal, fontWeight: FontWeight.w600),
                 ),
@@ -292,6 +325,80 @@ class RecitationPage extends ConsumerWidget {
         children: words.map((word) {
           return _wordChild(word);
         }).toList(),
+      ),
+    );
+  }
+
+  // Open-mic view: the full surah rendered as ONE continuous word flow (no
+  // per-ayah boxes/chips) with a small ayah-end marker, plus the live raw
+  // phoneme stream underneath.
+  Widget _buildOpenMicCard(RecitationResult state) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildOpenMicFlow(state),
+        const SizedBox(height: 12),
+        const Divider(height: 1),
+        const SizedBox(height: 8),
+        const Text(
+          'Live Predicted Phonemes:',
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54),
+        ),
+        const SizedBox(height: 4),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.05),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Directionality(
+            textDirection: TextDirection.rtl,
+            child: SelectableText(
+              state.livePhonemes.isEmpty ? '—' : state.livePhonemes,
+              textAlign: TextAlign.right,
+              style: const TextStyle(fontSize: 18, height: 1.4, fontFamily: 'Amiri'),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildOpenMicFlow(RecitationResult state) {
+    final ayahIds = state.surahWords.keys.toList()..sort();
+    if (ayahIds.isEmpty) {
+      return const Center(child: Text('Listening... will show the surah once detected'));
+    }
+    final children = <Widget>[];
+    for (final aId in ayahIds) {
+      final words = state.surahWords[aId] ?? [];
+      for (final word in words) {
+        children.add(_wordChild(word));
+      }
+      children.add(_ayahEndMarker());
+    }
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Wrap(
+        spacing: 12.0,
+        runSpacing: 16.0,
+        alignment: WrapAlignment.center,
+        children: children,
+      ),
+    );
+  }
+
+  Widget _ayahEndMarker() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Text(
+        '۝',
+        style: const TextStyle(
+          fontSize: 26,
+          color: Colors.teal,
+          fontWeight: FontWeight.bold,
+          height: 1.0,
+        ),
       ),
     );
   }
@@ -392,16 +499,30 @@ class RecitationPage extends ConsumerWidget {
     );
   }
 
-  // Full-surah view: one labeled block per ayah, ordered by ayah number
+  // Full-surah view: one labeled block per ayah, ordered by ayah number. In
+  // surah mode the current ayah is driven by nextAyah; in open-mic mode it
+  // follows the server's live detection (openMicAyah) and highlights words as
+  // they are recited.
   Widget _buildSurahView(RecitationResult state) {
     final ayahIds = state.surahWords.keys.toList()..sort();
     if (ayahIds.isEmpty) {
       return const Center(child: Text('No surah loaded'));
     }
-    // The ayah available to read now: defaults to the first ayah until the
-    // backend reports a next_ayah after the first pause.
-    final readNow = state.nextAyah != 0 ? state.nextAyah : (ayahIds.isNotEmpty ? ayahIds.first : 0);
-    final readingText = state.nextAyah != 0 ? '▶ Now read: Ayah ${state.nextAyah}' : '▶ Start reading: Ayah ${readNow}';
+    final bool isOpenMic = state.mode == RecitationMode.openMic;
+    final int? currentAyah;
+    final String headerText;
+    if (isOpenMic) {
+      currentAyah = state.openMicAyah;
+      headerText = currentAyah == null
+          ? 'Listening... auto-detecting your ayah'
+          : '▶ Now reading: Ayah $currentAyah';
+    } else {
+      // The ayah available to read now: defaults to the first ayah until the
+      // backend reports a next_ayah after the first pause.
+      final readNow = state.nextAyah != 0 ? state.nextAyah : ayahIds.first;
+      currentAyah = readNow;
+      headerText = state.nextAyah != 0 ? '▶ Now read: Ayah ${state.nextAyah}' : '▶ Start reading: Ayah $readNow';
+    }
     return Column(
       children: [
         Container(
@@ -412,7 +533,7 @@ class RecitationPage extends ConsumerWidget {
             borderRadius: BorderRadius.circular(8),
           ),
           child: Text(
-            readingText,
+            headerText,
             textAlign: TextAlign.center,
             style: const TextStyle(
               color: Colors.white,
@@ -423,7 +544,7 @@ class RecitationPage extends ConsumerWidget {
         ),
         ...ayahIds.map((aId) {
           final words = state.surahWords[aId] ?? [];
-          final isCurrent = aId == readNow;
+          final isCurrent = aId == currentAyah;
           final ayahAcc = state.ayahAccuracies[aId];
           final ayahPer = state.ayahPER[aId];
           return Container(
@@ -465,9 +586,9 @@ class RecitationPage extends ConsumerWidget {
                               color: Colors.teal,
                               borderRadius: BorderRadius.circular(8),
                             ),
-                            child: const Text(
-                              '▶ Read now',
-                              style: TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold),
+                            child: Text(
+                              isOpenMic ? '▶ Reading' : '▶ Read now',
+                              style: const TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
                           const SizedBox(width: 8),

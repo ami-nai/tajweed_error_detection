@@ -1,8 +1,13 @@
 enum RecitationStatus { idle, recording, processing, success, retry, error }
 
-enum RecitationMode { singleAyah, surah }
+enum RecitationMode { singleAyah, surah, openMic }
 
 enum LetterStatus { ok, miss, neutral }
+
+// Sentinel used by RecitationResult.copyWith to allow openMicAyah to be reset
+// to null (since the regular `Object?` + `??` pattern can't distinguish a
+// caller passing `null` from a caller omitting the argument).
+const _omit = Object();
 
 class LetterHit {
   final String ch;
@@ -51,6 +56,13 @@ class RecitationResult {
   // Mode
   final RecitationMode mode;
 
+  // Open-mic: the ayah id the currently displayed words belong to (null until
+  // detection, and bumped when the server re-detects a later ayah).
+  final int? openMicAyah;
+
+  // Open-mic: raw decoded phoneme stream as it is produced by the server.
+  final String livePhonemes;
+
   // Surah (sequential) mode fields
   final Map<int, List<WordTrackResult>> surahWords;
   final Map<int, double> ayahAccuracies;
@@ -83,6 +95,8 @@ class RecitationResult {
     this.accuracy = 0,
     this.per = 0,
     this.mode = RecitationMode.singleAyah,
+    this.openMicAyah,
+    this.livePhonemes = '',
     Map<int, List<WordTrackResult>>? surahWords,
     Map<int, double>? ayahAccuracies,
     this.surahAverage = 0,
@@ -143,6 +157,8 @@ class RecitationResult {
     double? accuracy,
     double? per,
     RecitationMode? mode,
+    Object? openMicAyah = _omit,
+    String? livePhonemes,
     Map<int, List<WordTrackResult>>? surahWords,
     Map<int, double>? ayahAccuracies,
     double? surahAverage,
@@ -168,6 +184,10 @@ class RecitationResult {
       accuracy: accuracy ?? this.accuracy,
       per: per ?? this.per,
       mode: mode ?? this.mode,
+      openMicAyah: identical(openMicAyah, _omit)
+          ? this.openMicAyah
+          : openMicAyah as int?,
+      livePhonemes: livePhonemes ?? this.livePhonemes,
       surahWords: surahWords ?? this.surahWords,
       ayahAccuracies: ayahAccuracies ?? this.ayahAccuracies,
       surahAverage: surahAverage ?? this.surahAverage,

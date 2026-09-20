@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import warnings
 import Levenshtein
 import numpy as np
@@ -9,6 +10,12 @@ import torch.nn as nn
 import torchaudio
 import torchaudio.functional as F
 from transformers import AutoFeatureExtractor, AutoModel
+
+from phonetic_trie import PhoneticTrie
+
+# Guards model inference: heartbeat delta evals (to_thread) may overlap the
+# final full-buffer eval, and torch isn't safe for concurrent forwards.
+_INFERENCE_LOCK = threading.Lock()
 
 warnings.filterwarnings("ignore")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,14 +159,11 @@ model.eval()
 extractor = AutoFeatureExtractor.from_pretrained("facebook/wav2vec2-base")
 
 
-def _predict_phonemes(audio_path: str) -> str:
-    """Load raw PCM audio and run model inference, returning the decoded
-    phoneme prediction string (shared by evaluate_audio and sequential mode)."""
-    # 1. Load the raw bytes directly
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    # 2. Convert raw bytes to numpy array (16-bit PCM)
+def _bytes_to_prediction(audio_bytes: bytes) -> str:
+    """Run model inference over raw 16-bit PCM bytes, returning the decoded
+    phoneme prediction string (shared by evaluate_audio, live deltas, and
+    open-mic resolution)."""
+    # 1. Convert raw bytes to numpy array (16-bit PCM)
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
     audio_np /= 32768.0
 
@@ -178,9 +182,10 @@ def _predict_phonemes(audio_path: str) -> str:
     )
 
     # Inference
-    with torch.no_grad():
-        logits = model(inputs)
-        pred_ids = torch.argmax(logits[0], dim=-1)
+    with _INFERENCE_LOCK:
+        with torch.no_grad():
+            logits = model(inputs)
+            pred_ids = torch.argmax(logits[0], dim=-1)
 
     # CTC Decode: collapse adjacent duplicates FIRST (preserves madd/long vowels),
     # THEN remove blanks/pads. Matches notebook training decode (cell 13).
@@ -200,6 +205,19 @@ def _predict_phonemes(audio_path: str) -> str:
     pred_str = "".join(final_pred)
     print(f"🔮 [ML ENGINE] Cleaned AI Prediction String: '{pred_str}'")
     return pred_str
+
+
+def predict_phonemes_bytes(audio_bytes: bytes) -> str:
+    """Public bytes-based prediction (live heartbeat deltas, open-mic lookup)."""
+    return _bytes_to_prediction(audio_bytes)
+
+
+def _predict_phonemes(audio_path: str) -> str:
+    """Load raw PCM audio and run model inference, returning the decoded
+    phoneme prediction string (shared by evaluate_audio and sequential mode)."""
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    return _bytes_to_prediction(audio_bytes)
 
 
 def DIACRITICS_STRIP():
@@ -534,3 +552,146 @@ def get_surah_words(surah_id: int) -> list[list[dict]]:
     for a_id in ayahs:
         result.append(TAJWEED_ONLY_INDEX[surah_id][a_id]["words"])
     return result
+
+
+def _get_fallback_target(raw_text):
+    """Strips tashkeel/diacritics and keeps only characters inside TRAINED_PHONEMES."""
+    diacritics = [
+        "ِ", "ُ", "َ", "ْ", "ّ", "ً", "ٌ", "ٍ", "ٰ", "ٓ", "ۦ", "ۧ",
+    ]
+    clean_text = "".join([c for c in raw_text if c not in diacritics])
+    return "".join([c for c in clean_text if c in TRAINED_PHONEMES])
+
+
+class GuidedLiveTrie:
+    """Ordered, monotonic live word-confirmation pointer over an ayah's words.
+
+    The user's decoded phoneme stream is fed in small beats; `confirm()` tries
+    to lock the *next* unread word against the expected target, in order, using
+    the same exact-substring / sliding-window Levenshtein rule as evaluate_audio
+    so interim results and the authoritative final stay consistent.
+    """
+
+    def __init__(self, word_data):
+        self.words = word_data
+        self.targets = []
+        for w in word_data:
+            target = "".join(p for p in w["phonemes"] if p in TRAINED_PHONEMES)
+            if not target:
+                target = _get_fallback_target(w["text"])
+            self.targets.append(strip_diacritics(target))
+        self._idx = 0
+        self._tail = ""
+        self.trie = PhoneticTrie()
+        for i, t in enumerate(self.targets):
+            if t:
+                self.trie.insert(t, word_idx=i)
+
+    @property
+    def next_word_index(self):
+        return self._idx
+
+    @property
+    def pending_tail(self):
+        return self._tail
+
+    def feed(self, pred_str):
+        self._tail += strip_diacritics(pred_str)
+
+    def confirm(self):
+        newly = []
+        while self._idx < len(self.words) and self._tail:
+            target = self.targets[self._idx]
+            if not target:
+                self._idx += 1
+                continue
+            span = self._find_span(target)
+            if span is None:
+                break
+            start, end = span
+            window = self._tail[start:end]
+            self._tail = self._tail[end:]
+
+            win = len(target)
+            consonant_statuses = []
+            for rc, hc in _align_with_ops(target, window):
+                if rc is None:
+                    continue
+                consonant_statuses.append("ok" if hc == rc else "miss")
+            if not consonant_statuses:
+                consonant_statuses = ["miss"] * win
+
+            newly.append(
+                {
+                    "index": self._idx,
+                    "text": self.words[self._idx]["text"],
+                    "is_read": True,
+                    "letters": _assign_letters(self.words[self._idx]["text"], consonant_statuses),
+                }
+            )
+            self._idx += 1
+        return newly
+
+    def _find_span(self, target):
+        """Return (start, end) of target in the tail (early bounded region only,
+        so word order is respected), or None."""
+        tail = self._tail
+        win = len(target)
+        if win == 0:
+            return None
+        bound = min(len(tail), max(len(target) * 4, len(target) + 40))
+
+        if target in tail[:bound]:
+            start = tail.index(target)
+            return (start, start + win)
+
+        if len(tail) >= win:
+            best = None
+            for i in range(min(bound, len(tail) - win + 1)):
+                sub = tail[i : i + win]
+                dist = Levenshtein.distance(sub, target)
+                if best is None or dist < best[0]:
+                    best = (dist, i)
+                if dist <= max(1, int(win * 0.35)):
+                    break
+            if best and best[0] <= max(1, int(win * 0.35)):
+                return (best[1], best[1] + win)
+            return None
+
+        if not tail:
+            return None
+        dist = Levenshtein.distance(tail, target)
+        if dist <= max(1, int(win * 0.4)):
+            return (0, len(tail))
+        return None
+
+
+_GLOBAL_AYAH_TRIE = None
+
+
+def _ensure_global_ayah_trie():
+    global _GLOBAL_AYAH_TRIE
+    if _GLOBAL_AYAH_TRIE is None:
+        _GLOBAL_AYAH_TRIE = PhoneticTrie()
+        for s_id in TAJWEED_ONLY_INDEX:
+            for a_id in TAJWEED_ONLY_INDEX[s_id]:
+                stream = TAJWEED_ONLY_INDEX[s_id][a_id]["expected_full"]
+                _GLOBAL_AYAH_TRIE.insert(list(stream), surah_id=s_id, ayah_id=a_id)
+    return _GLOBAL_AYAH_TRIE
+
+
+def resolve_ayah(pred_str, surahs=None, err_rate=0.35, min_tokens=5):
+    """Open-mic resolution: decide which ayah best explains the predicted stream.
+
+    surahs (optional set) narrows the candidate pool. Returns
+    (surah_id, ayah_id, cost, score, depth) or None when ambiguous/insufficient.
+    """
+    if not pred_str or len(strip_diacritics(pred_str)) < min_tokens:
+        return None
+    trie = _ensure_global_ayah_trie()
+    return trie.search_fuzzy(
+        list(pred_str),
+        allowed_surahs=surahs,
+        err_rate=err_rate,
+        min_tokens=min_tokens,
+    )

@@ -59,6 +59,27 @@ List<DiffHit> _parseDiff(Object? diff) {
   }).toList();
 }
 
+List<WordTrackResult> _parseServerWords(Object? wordsRaw) {
+  if (wordsRaw is! List) return [];
+  return wordsRaw.map((item) {
+    if (item is Map) {
+      final m = item.cast<String, dynamic>();
+      final letters = (m['letters'] as List?)?.map((l) {
+        if (l is Map) {
+          return LetterHit.fromJson(l.cast<String, dynamic>());
+        }
+        return LetterHit(ch: l.toString(), status: LetterStatus.neutral);
+      }).toList() ?? const <LetterHit>[];
+      return WordTrackResult(
+        text: m['text']?.toString() ?? '',
+        isRead: m['is_read'] == true || m['isRead'] == true,
+        letters: letters,
+      );
+    }
+    return WordTrackResult(text: item.toString(), isRead: false);
+  }).toList();
+}
+
 final dataSourceProvider = Provider((ref) {
   return RecitationRemoteDataSource(kBackendUrl);
 });
@@ -93,21 +114,70 @@ class RecitationNotifier extends Notifier<RecitationResult> {
     return normalized.trim();
   }
 
+  // Seed the full-surah word map (all ayahs, unread) from the local Quran text.
+  Map<int, List<WordTrackResult>> _seedSurahWords(int surahId) {
+    final ayahs = quranTextDatabase[surahId] ?? {};
+    final out = <int, List<WordTrackResult>>{};
+    for (final entry in ayahs.entries) {
+      out[entry.key] = entry.value
+          .map((w) => WordTrackResult(text: w, isRead: false))
+          .toList();
+    }
+    return out;
+  }
+
+  void _clearAyahMetrics() {
+    state = state.copyWith(
+      ayahAccuracies: {},
+      surahAverage: 0,
+      currentAyah: 0,
+      nextAyah: 0,
+      ayahPER: {},
+      surahPER: 0,
+      diff: [],
+      ayahDiffs: {},
+      ayahExpected: {},
+      ayahPredicted: {},
+      ayahMistakes: {},
+    );
+  }
+
   void setMode(RecitationMode mode) {
     if (mode == state.mode) return;
-    state = state.copyWith(mode: mode, status: RecitationStatus.idle);
     if (mode == RecitationMode.singleAyah) {
       _loadSingleAyah(state.selectedSurah, state.selectedAyah);
-    } else {
+    } else if (mode == RecitationMode.surah) {
       _loadSurah(state.selectedSurah);
+    } else {
+      state = state.copyWith(
+        mode: mode,
+        status: RecitationStatus.idle,
+        words: [],
+        openMicAyah: null,
+        livePhonemes: '',
+        surahWords: _seedSurahWords(state.selectedSurah),
+      );
+      _clearAyahMetrics();
     }
   }
 
   void updateSelection(int surahId, int ayahId) {
     if (state.mode == RecitationMode.singleAyah) {
       _loadSingleAyah(surahId, ayahId);
-    } else {
+    } else if (state.mode == RecitationMode.surah) {
       _loadSurah(surahId);
+    } else {
+      // Open Mic: surah is only a candidate filter; the full surah is shown and
+      // words get highlighted once the server detects the recited ayah.
+      state = state.copyWith(
+        selectedSurah: surahId,
+        selectedAyah: 1,
+        words: [],
+        openMicAyah: null,
+        livePhonemes: '',
+        surahWords: _seedSurahWords(surahId),
+      );
+      _clearAyahMetrics();
     }
   }
 
@@ -150,21 +220,37 @@ class RecitationNotifier extends Notifier<RecitationResult> {
     try {
       await _serverSubscription?.cancel();
 
+      final modeStr = switch (state.mode) {
+        RecitationMode.surah => 'surah',
+        RecitationMode.openMic => 'open_mic',
+        RecitationMode.singleAyah => 'single',
+      };
+
       if (state.mode == RecitationMode.singleAyah && ayahId != null) {
         final staticWords = quranTextDatabase[surahId]?[ayahId] ?? [];
         state = state.copyWith(
           status: RecitationStatus.recording,
           words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
         );
-      } else {
-        // Surah mode
+      } else if (state.mode == RecitationMode.surah) {
         _loadSurah(surahId);
         state = state.copyWith(status: RecitationStatus.recording);
+      } else {
+        // Open Mic: words are seeded once the server detects an ayah; the full
+        // surah is already on screen and highlighting follows detection.
+        state = state.copyWith(
+          status: RecitationStatus.recording,
+          words: [],
+          openMicAyah: null,
+          livePhonemes: '',
+          surahWords: _seedSurahWords(surahId),
+        );
+        _clearAyahMetrics();
       }
 
       print("🔵 [RECITATION PROV] Preparing stream for Surah: $surahId, mode: ${state.mode}");
       final repository = ref.read(repositoryProvider);
-      final serverStream = await repository.startStreaming(surahId, ayahId);
+      final serverStream = await repository.startStreaming(surahId, ayahId, mode: modeStr);
       print("🟢 [RECITATION PROV] Stream connection successfully initiated!");
 
       _serverSubscription = serverStream.listen(
@@ -173,17 +259,21 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           try {
             final Map<String, dynamic> data = jsonDecode(event);
             _handleServerPayload(data);
-          } catch (parseError) {
-            print("❌ [PARSER ERROR] Error interpreting JSON payload: $parseError");
+          } catch (payloadError) {
+            // A single malformed message must never tear down the stream.
+            print("❌ [PAYLOAD ERROR] Ignoring malformed server message: $payloadError");
           }
         },
         onError: (error) {
           print("❌ [STREAM ERROR] The server stream emitted an error: $error");
           state = state.copyWith(status: RecitationStatus.error);
-          stopReciting();
+          // Tear down the broken channel WITHOUT sending a 'stop' (a 'stop' here
+          // would finalize mid-recite). The Stop button is the only finalize path.
+          ref.read(dataSourceProvider).abortStreaming();
         },
         onDone: () {
           print("🔌 [STREAM CLOSED] The server connection closed down automatically (onDone).");
+          state = state.copyWith(status: RecitationStatus.idle);
         }
       );
     } catch (e) {
@@ -194,10 +284,10 @@ class RecitationNotifier extends Notifier<RecitationResult> {
 
   void _handleServerPayload(Map<String, dynamic> data) {
     final mode = data['mode']?.toString() ?? 'single';
+    final bool isFinal = data['final'] == true;
 
     if (mode == 'surah') {
-      // Fast "advance" message: pause detected, tell the user which ayah to read next
-      // immediately, without waiting for the inference result of the finished ayah.
+      // Fast "advance" message (legacy): immediately tell which ayah to read next.
       final readNow = data['read_now'];
       if (data['advance'] == true) {
         final isFinished = data['finished'] == true;
@@ -209,7 +299,7 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         return;
       }
 
-      // Sequential surah mode
+      // Sequential surah mode (interim final:false messages and next/stop finals).
       final surahWords = state.surahWords;
       final finalAyahId = (data['current_ayah'] as num?)?.toInt() ?? state.currentAyah;
 
@@ -297,71 +387,163 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       );
       print("📈 [SURAH STATE] avg=${state.surahAverage} current=${state.currentAyah}");
     } else {
-      // Single ayah mode (original logic)
-      List<String> recognizedWords = [];
-      List<dynamic> serverWords = [];
-      if (data.containsKey('words')) {
-        final words = data['words'];
-        if (words is List) {
-          serverWords = words;
-          for (var item in words) {
-            if (item is Map) {
-              if (item['is_read'] == true || item['isRead'] == true) {
-                recognizedWords.add(item['text']?.toString() ?? '');
-              }
-            } else if (item is String) {
-              recognizedWords.add(item);
-            }
-          }
-        }
+      // Single-ayah / open-mic mode.
+      final isOpenMic = data['mode']?.toString() == 'open_mic';
+
+      // Open-mic detection reflects the detected target in the UI selection.
+      int? detectedAyah;
+      final detected = data['detected'];
+      if (detected is Map) {
+        final m = detected.cast<String, dynamic>();
+        final s = (m['surah_id'] as num).toInt();
+        final a = (m['ayah_id'] as num).toInt();
+        detectedAyah = a;
+        state = state.copyWith(
+          selectedSurah: s,
+          selectedAyah: a,
+          // If detection landed on a different surah than the seeded one,
+          // reseed the full-surah display for it.
+          surahWords: s != state.selectedSurah ? _seedSurahWords(s) : state.surahWords,
+        );
+        print("🎯 [OPEN MIC] Server detected surah=$s ayah=$a");
       }
 
-      final normalizedBackend = recognizedWords.map((w) => _normalizeArabic(w)).toList();
+      final serverWords = _parseServerWords(data['words']);
+      final liveStream = data['live']?.toString();
 
-      final mergedWords = state.words.asMap().entries.map((entry) {
-        final index = entry.key;
-        final localWord = entry.value;
-        final normalizedLocal = _normalizeArabic(localWord.text);
-        bool isWordRead = localWord.isRead || normalizedBackend.contains(normalizedLocal);
+      if (isFinal) {
+        // Authoritative result: REPLACE word state (and metrics) wholesale.
+        final replaced = serverWords.isNotEmpty ? serverWords : state.words;
+        final finalAyah = detectedAyah ?? state.openMicAyah ?? state.selectedAyah;
+        final finalSurahWords = Map<int, List<WordTrackResult>>.from(state.surahWords);
+        if (replaced.isNotEmpty) finalSurahWords[finalAyah] = replaced;
+        state = state.copyWith(
+          status: RecitationStatus.success,
+          words: replaced,
+          openMicAyah: detectedAyah ?? state.openMicAyah,
+          surahWords: finalSurahWords,
+          livePhonemes: liveStream ?? state.livePhonemes,
+          realText: data['real_text']?.toString() ?? state.realText,
+          expected: data['expected']?.toString() ?? state.expected,
+          predicted: data['predicted']?.toString() ?? state.predicted,
+          accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
+          per: (data['per'] as num?)?.toDouble() ?? state.per,
+          diff: data.containsKey('diff') ? _parseDiff(data['diff']) : state.diff,
+          mistakes: (data['mistakes'] as List?)?.map((e) => e.toString()).toList() ?? state.mistakes,
+        );
+      } else if (isOpenMic) {
+        // Live per-ayah highlight as the server detects/progresses.
+        final int? currentAyah = detectedAyah ?? state.openMicAyah;
+        final mergedSurahWords = Map<int, List<WordTrackResult>>.from(state.surahWords);
 
-        // Carry per-letter highlights from the server (align by index; server
-        // keeps the same word order as the local ayah words).
-        List<LetterHit> letters = localWord.letters;
-        if (index < serverWords.length && serverWords[index] is Map) {
-          final sw = (serverWords[index] as Map).cast<String, dynamic>();
-          final sRead = sw['is_read'] == true || sw['isRead'] == true;
-          isWordRead = isWordRead || sRead;
-          if (sw['letters'] is List) {
-            letters = (sw['letters'] as List).map((l) {
-              if (l is Map) {
-                return LetterHit.fromJson(l.cast<String, dynamic>());
-              }
-              return LetterHit(ch: l.toString(), status: LetterStatus.neutral);
-            }).toList();
-          }
+        if (state.words.isEmpty && serverWords.isNotEmpty) {
+          // First detection seeds the ayah wholesale (border + words light up).
+          if (currentAyah != null) mergedSurahWords[currentAyah] = serverWords;
+          state = state.copyWith(
+            words: serverWords,
+            openMicAyah: detectedAyah,
+            surahWords: mergedSurahWords,
+            livePhonemes: liveStream ?? state.livePhonemes,
+          );
+          return;
         }
 
-        return WordTrackResult(text: localWord.text, isRead: isWordRead, letters: letters);
-      }).toList();
+        // The server re-detected a LATER ayah (forward advance): replace the
+        // whole word state with the new ayah and drop stale metrics so nothing
+        // from the previous ayah leaks into the new one.
+        if (detectedAyah != null &&
+            state.openMicAyah != null &&
+            detectedAyah != state.openMicAyah &&
+            serverWords.isNotEmpty) {
+          print("🎯 [OPEN MIC] Advanced to ayah $detectedAyah — moving highlight");
+          if (currentAyah != null) mergedSurahWords[currentAyah] = serverWords;
+          state = state.copyWith(
+            words: serverWords,
+            openMicAyah: detectedAyah,
+            surahWords: mergedSurahWords,
+            livePhonemes: liveStream ?? state.livePhonemes,
+            realText: '',
+            expected: '',
+            predicted: '',
+            accuracy: 0,
+            per: 0,
+            diff: [],
+            mistakes: [],
+          );
+          return;
+        }
 
-      state = state.copyWith(
-        words: mergedWords,
-        realText: data['real_text']?.toString() ?? state.realText,
-        expected: data['expected']?.toString() ?? state.expected,
-        predicted: data['predicted']?.toString() ?? state.predicted,
-        accuracy: (data['accuracy'] as num?)?.toDouble() ?? state.accuracy,
-        per: (data['per'] as num?)?.toDouble() ?? state.per,
-        diff: _parseDiff(data['diff']),
-        mistakes: (data['mistakes'] as List?)?.map((e) => e.toString()).toList() ?? state.mistakes,
-      );
+        // OR-merge letter/word highlights into the current ayah.
+        final merged = _mergeServerWords(state.words, serverWords);
+        if (currentAyah != null) mergedSurahWords[currentAyah] = merged;
+        state = state.copyWith(
+          words: merged,
+          surahWords: mergedSurahWords,
+          livePhonemes: liveStream ?? state.livePhonemes,
+        );
+      } else {
+        // Single-ayah interim: OR-merge words/letters only.
+        state = state.copyWith(words: _mergeServerWords(state.words, serverWords));
+      }
+    }
+  }
+
+  // Layer server-confidence (word + letter) marks onto the local ayah words.
+  // Index alignment keeps word order stable; server words are authoritative for
+  // per-letter status and OR-accumulate the "read" flag across heartbeats.
+  List<WordTrackResult> _mergeServerWords(
+      List<WordTrackResult> localWords, List<WordTrackResult> serverWords) {
+    if (serverWords.isEmpty) return localWords;
+    final normalizedBackend =
+        serverWords.where((w) => w.isRead).map((w) => _normalizeArabic(w.text)).toList();
+
+    return localWords.asMap().entries.map((entry) {
+      final index = entry.key;
+      final localWord = entry.value;
+      final normalizedLocal = _normalizeArabic(localWord.text);
+      bool isWordRead =
+          localWord.isRead || normalizedBackend.contains(normalizedLocal);
+
+      // Carry per-letter highlights from the server (align by index; server
+      // keeps the same word order as the local ayah words).
+      List<LetterHit> letters = localWord.letters;
+      if (index < serverWords.length) {
+        final sw = serverWords[index];
+        isWordRead = isWordRead || sw.isRead;
+        if (sw.letters.isNotEmpty) letters = sw.letters;
+      }
+      return WordTrackResult(text: localWord.text, isRead: isWordRead, letters: letters);
+    }).toList();
+  }
+
+  // Surah mode: tell the server the current ayah is finished.
+  Future<void> nextAyah() async {
+    print("🔵 [RECITATION PROV] Sending 'next' to advance the surah...");
+    try {
+      await ref.read(repositoryProvider).nextAyah();
+    } catch (e) {
+      print("❌ [NEXT ERROR] $e");
     }
   }
 
   Future<void> stopReciting() async {
-    print("🔵 [RECITATION PROV] Manually terminating stream...");
-    await _serverSubscription?.cancel();
-    await ref.read(repositoryProvider).stopStreaming();
-    state = state.copyWith(status: RecitationStatus.idle);
+    print("🔵 [RECITATION PROV] Requesting authoritative final from server...");
+    try {
+      // Sending "stop" keeps the channel open so the {final:true} message can be
+      // delivered; onDone fires afterwards and sets the state to idle.
+      await ref.read(repositoryProvider).stopStreaming();
+    } catch (e) {
+      print("❌ [STOP ERROR] $e");
+    }
+    // Fallback: if the server never replies, force-close and go idle.
+    Future.delayed(const Duration(seconds: 15), () async {
+      try {
+        await ref.read(dataSourceProvider).forceClose();
+      } catch (_) {}
+      if (state.status == RecitationStatus.recording) {
+        state = state.copyWith(status: RecitationStatus.idle);
+      }
+    });
   }
 }
 
