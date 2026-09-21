@@ -680,6 +680,17 @@ class GuidedLiveTrie:
                 continue
             span = self._find_span(target)
             if span is None:
+                # Follow-along tolerance: if the CURRENT word's phonemes are
+                # missing from the decoded stream (e.g. clipped at the mic
+                # start) but the NEXT word clearly matches, advance past the
+                # gap instead of freezing the spotlight on the word the model
+                # never saw. Never skips a word whose successor is absent.
+                nxt = self._idx + 1
+                if nxt < len(self.words) and self.targets[nxt]:
+                    nxt_span = self._find_span(self.targets[nxt], budget_mult=0.6)
+                    if nxt_span is not None:
+                        self._idx += 1
+                        continue
                 break
             start, end = span
             window = self._tail[start:end]
@@ -705,7 +716,7 @@ class GuidedLiveTrie:
             self._idx += 1
         return newly
 
-    def _find_span(self, target):
+    def _find_span(self, target, budget_mult=1.0):
         """Return (start, end) of target in the tail (early bounded region only,
         so word order is respected), or None."""
         tail = self._tail
@@ -725,16 +736,16 @@ class GuidedLiveTrie:
                 dist = Levenshtein.distance(sub, target)
                 if best is None or dist < best[0]:
                     best = (dist, i)
-                if dist <= max(1, int(win * 0.35)):
+                if dist <= max(1, int(win * 0.35 * budget_mult)):
                     break
-            if best and best[0] <= max(1, int(win * 0.35)):
+            if best and best[0] <= max(1, int(win * 0.35 * budget_mult)):
                 return (best[1], best[1] + win)
             return None
 
         if not tail:
             return None
         dist = Levenshtein.distance(tail, target)
-        if dist <= max(1, int(win * 0.4)):
+        if dist <= max(1, int(win * 0.4 * budget_mult)):
             return (0, len(tail))
         return None
 

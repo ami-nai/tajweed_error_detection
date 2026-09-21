@@ -58,6 +58,12 @@ def _stub_advance(result):
     return _inner, collected
 
 
+def _stub_decode(decode_str):
+    """Pin the phrase-level decoder so advance/burst tests never touch the
+    real model. main imports _bytes_to_prediction into its namespace."""
+    main._bytes_to_prediction = lambda _b: decode_str
+
+
 async def _advance_commits_later_ayah():
     s = _make_session()
     s.resolved = (111, 1)
@@ -67,6 +73,7 @@ async def _advance_commits_later_ayah():
     s.guided._idx = len(s.guided.words)  # exhaust the first ayah
     s.audio.extend(b"\x00\x00" * 16000)  # pretend audio has accumulated
     s.feed_tail = "يبايدواحمليدةوايديحمادننوليبدونا"
+    _stub_decode("تب وتب لهب يدا ابي")
     stub, _ = _stub_advance((111, 2, 0.92))
     main.advance_target = stub
     await s._maybe_advance_openmic()
@@ -89,12 +96,12 @@ async def _same_or_backward_never_advances():
     s.ayah_id = 1
     s._init_guided()
     s.guided._idx = len(s.guided.words)
-    s.feed_tail = "فياداومالنبنرتدب"
+    s.audio.extend(b"\x00\x00" * 16000)
+    _stub_decode("فياداومالنبنرتدب")
     stub, _ = _stub_advance((111, 1, 0.8))
     main.advance_target = stub
     await s._maybe_advance_openmic()
     assert s.resolved == (111, 1), s.resolved
-    assert s.feed_tail == "فياداومالنبنرتدب", s.feed_tail
 
     # advance returns a BACKWARD ayah -> must not advance.
     s2 = _make_session()
@@ -103,7 +110,8 @@ async def _same_or_backward_never_advances():
     s2.ayah_id = 2
     s2._init_guided()
     s2.guided._idx = len(s2.guided.words)
-    s2.feed_tail = "منولهولنحيوااللهدالاعلىعلي"
+    s2.audio.extend(b"\x00\x00" * 16000)
+    _stub_decode("منولهولنحيوااللهدالاعلىعلي")
     stub2, _ = _stub_advance((111, 1, 0.7))
     main.advance_target = stub2
     await s2._maybe_advance_openmic()
@@ -120,8 +128,6 @@ async def _cooldown_prevents_spam():
     s.ayah_id = 1
     s._init_guided()
     s.guided._idx = len(s.guided.words)
-    s.feed_tail = "لاييداوامالحن"
-    s._om_last_attempt = 10 ** 9  # clean can never grow past it
     s._om_ticks_at_attempt = s._tick_cnt  # 0 beats elapsed -> still cooling down
     stub, collected = _stub_advance((111, 2, 0.85))
     main.advance_target = stub
@@ -141,8 +147,8 @@ async def _advance_cooldown_recovers():
     s.ayah_id = 1
     s._init_guided()
     s.guided._idx = len(s.guided.words)
-    s.feed_tail = "لاييداوامال حن وتب ما اغنى عنه ماله"
-    s._om_last_attempt = len(s._clean_openmic_tail(s.feed_tail))
+    s.audio.extend(b"\x00\x00" * 16000)
+    _stub_decode("لاييداوامال حن وتب ما اغنى عنه ماله")
     s._om_ticks_at_attempt = s._tick_cnt - main.STALL_ADVANCE_TICKS
     stub, collected = _stub_advance((111, 2, 0.9))
     main.advance_target = stub
@@ -150,6 +156,37 @@ async def _advance_cooldown_recovers():
     assert collected["calls"] == 1, "must retry once the cooldown beats elapsed"
     assert s.resolved == (111, 2), s.resolved
     print("COOLDOWN-RECOVERY OK -> pinned window still retries after cooldown")
+
+
+async def _advance_uses_fresh_audio():
+    # O1: the advance decision is fuelled by a FRESH full-context decode of the
+    # recent audio, never the chopped strip / feed_tail. Pin that the audio
+    # slice passed to _bytes_to_prediction is the trailing window and that the
+    # matcher receives its cleaned decode.
+    s = _make_session()
+    s.resolved = (111, 1)
+    s.surah_id = 111
+    s.ayah_id = 1
+    s._init_guided()
+    s.guided._idx = len(s.guided.words)
+    s.audio.extend(b"\x00\x00" * main.STALL_DECODE_SAMPLES)
+    captured = {}
+
+    def fake_decode(b):
+        captured["bytes"] = b
+        return "تب لهب وتب ما اغنى عنه ماله وما كسب"
+
+    main._bytes_to_prediction = fake_decode
+    calls = []
+    main.advance_target = lambda pred, cs, ca, allowed=None: (calls.append(pred), (111, 2, 0.8))[1]
+    s._om_ticks_at_attempt = s._tick_cnt - main.STALL_ADVANCE_TICKS
+    await s._maybe_advance_openmic()
+    expected_slice = bytes(s.audio[-main.STALL_DECODE_SAMPLES:])
+    assert captured.get("bytes") == expected_slice, (len(captured.get("bytes", b"")), len(expected_slice))
+    assert len(calls) == 1
+    assert calls[0] == "تب لهب وتب ما اغنى عنه ماله وما كسب", calls[0]
+    assert s.resolved == (111, 2), s.resolved
+    print("FRESH-AUDIO OK -> advance decodes trailing audio, not the strip")
 
 
 async def _first_commit_keeps_audio_marker():
@@ -165,36 +202,6 @@ async def _first_commit_keeps_audio_marker():
     print("FIRST-COMMIT OK -> marker stays 0, words seeded")
 
 
-async def _windowed_resolve_and_trim():
-    # feed_tail is polluted with the whole previous ayah; re-resolution must use
-    # only the RECENT window and drop the stale prefix.
-    s = _make_session()
-    s.resolved = (111, 1)
-    s.surah_id = 111
-    s.ayah_id = 1
-    s._init_guided()
-    s.guided._idx = len(s.guided.words)
-    s.feed_tail = ("A" * 200) + ("B" * 200)
-    window_len = max(
-        main.MIN_ADVANCE_WINDOW_TOKENS,
-        2 * len(main.strip_diacritics(main.TAJWEED_ONLY_INDEX[111][1]["expected_full"])),
-    )
-    calls = []
-
-    def stub(pred_str, cur_s, cur_a, allowed_surahs=None):
-        calls.append(pred_str)
-        return (111, 1, 0.2)  # same ayah -> forward-guard blocks the commit
-
-    main.advance_target = stub
-    await s._maybe_advance_openmic()
-    assert len(calls) == 1
-    assert "A" not in calls[0], f"stale prefix leaked into resolve window: {calls[0]!r}"
-    assert len(s.feed_tail) == window_len, (len(s.feed_tail), window_len)
-    assert s.feed_tail == calls[0]
-    assert all(c == "B" for c in s.feed_tail)
-    print("WINDOWED-RESOLVE OK -> stale prefix trimmed, window =", window_len)
-
-
 async def _stall_triggers_advance_without_full_confirmation():
     # The user's words never fully confirm (crude phonemizer); the stall
     # counter must still advance the ayah after a few unproductive beats.
@@ -206,6 +213,7 @@ async def _stall_triggers_advance_without_full_confirmation():
     original_decode = main.decode_live_window
     # Phase A: the tick decodes a trailing window, not the raw delta.
     main.decode_live_window = lambda _w, _n, _p, _f, _l: ("zzzzzzzz", None)  # never matches
+    _stub_decode("وتبه لهب لما تب")
     stub, _ = _stub_advance((111, 2, 0.85))
     main.advance_target = stub
     try:
@@ -437,6 +445,45 @@ def _multi_ayah_expected_span():
     print("MULTI-AYAH SPAN OK -> final expected text covers the recited ayahs")
 
 
+async def _guided_skips_clipped_first_word():
+    # B: if word 0's phonemes never appear in the decode (mic clipped the first
+    # word) but word 1 clearly matches, the ordered trie must advance past the
+    # gap instead of freezing the spotlight on index 0.
+    s = _make_session()
+    s.resolved = (111, 1)
+    s.surah_id = 111
+    s.ayah_id = 1
+    s._init_guided()
+    g = s.guided
+    assert g.targets[0] and g.targets[1], "fixture moved"
+    g.feed(g.targets[1])  # only word 1's phonemes make it into the stream
+    newly = g.confirm()
+    assert [n["index"] for n in newly] == [1], newly  # يَدَا locked, تَبَّتْ skipped
+    assert g.active_index == 2, g.active_index
+    assert g._tail == "", g._tail
+    print("SKIP-TOLERANCE OK -> clipped first word does not freeze the pointer")
+
+
+async def _burst_phrase_feed_locks_whole_phrase():
+    # B: a burst-end phrase-level decode of the real expected text must lock
+    # EVERY word of the ayah from the clean decode (not the chopped strip).
+    s = _make_session()
+    s.resolved = (111, 1)
+    s.surah_id = 111
+    s.ayah_id = 1
+    s._init_guided()
+    s.audio.extend(b"\x00\x00" * 16000)
+    s._burst_start = 0
+    exp1 = main.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    _stub_decode(exp1)
+    await s._feed_openmic_phrase(burst_end=True)
+    assert s._burst_start is None, "burst consumed"
+    assert s._last_phrase_feed == len(s.audio)
+    assert s.guided.active_index is None, s.guided.active_index
+    assert all(w["is_read"] for w in s.session_words), s.session_words
+    print("BURST-PHRASE OK -> clean phrase decode locks every word of the ayah")
+
+
 def run_single():
     with client.websocket_connect("/ws/recite") as ws:
         ws.send_text(json.dumps({"mode": "single", "surah_id": 112, "ayah_id": 1}))
@@ -507,7 +554,7 @@ if __name__ == "__main__":
     asyncio.run(_cooldown_prevents_spam())
     asyncio.run(_advance_cooldown_recovers())
     asyncio.run(_first_commit_keeps_audio_marker())
-    asyncio.run(_windowed_resolve_and_trim())
+    asyncio.run(_advance_uses_fresh_audio())
     asyncio.run(_stall_triggers_advance_without_full_confirmation())
     asyncio.run(_low_bytes_still_streams_live())
     asyncio.run(_predict_error_keeps_session_alive())
@@ -519,4 +566,6 @@ if __name__ == "__main__":
     asyncio.run(_windowed_decode_emits_only_new_tail())
     asyncio.run(_advance_from_mid_ayah_matches_tail())
     _multi_ayah_expected_span()
+    asyncio.run(_guided_skips_clipped_first_word())
+    asyncio.run(_burst_phrase_feed_locks_whole_phrase())
     print("ALL SMOKE TESTS PASSED")

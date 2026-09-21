@@ -12,8 +12,6 @@
 **/*$py.class
 
 # Backend environment secrets
-**/.env
-**/.env.*
 !**/.env.example
 
 # Large files
@@ -60,5 +58,6 @@ spotlight_changes.md
 # ==========================================
 .DS_Store
 Thumbs.db
-**/.vscode/
 **/.idea/
+config.bat
+node_modules
