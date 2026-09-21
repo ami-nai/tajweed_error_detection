@@ -16,6 +16,7 @@ from ml_engine import (
     resolve_ayah,
     advance_target,
     strip_diacritics,
+    _bytes_to_prediction,
 )
 
 app = FastAPI()
@@ -36,14 +37,21 @@ MIN_RESOLVE_TOKENS = 5
 # Open mic: if no new word confirms for STALL_ADVANCE_TICKS consecutive beats,
 # assume the user has moved on and re-resolve the ayah on a recent-token window.
 STALL_ADVANCE_TICKS = 3
-# Lower bound on the recent-token window used for ayah re-resolution.
-MIN_ADVANCE_WINDOW_TOKENS = 40
 # Phase A live decode: each speech beat decodes this trailing context window
 # (3 s) and emits only the newly-covered frames (see decode_live_window).
 # Right-context lookahead in frames: the emitted slice always ends this far
 # before the inference pad.
 LIVE_WINDOW_SAMPLES = 48000
 LIVE_LEAD_FRAMES = 16
+# Phrase-level decisions (advance + in-ayah smooth follow) decode the trailing
+# audio in ONE full-context pass instead of the chopped 0.5 s-slice strip,
+# which our offline experiment measured as the weakest signal class.
+STALL_DECODE_SAMPLES = LIVE_WINDOW_SAMPLES + 16000  # ~4 s of audio
+# Smallest speech burst worth a phrase-level decode (0.5 s at 16 kHz).
+MIN_PHRASE_BYTES = 8000
+# Mid-burst phrase re-decode cadence: bytes of NEW speech since the last feed
+# that forces another phrase-level decode while a long burst is still going.
+PHRASE_REDECODE_BYTES = 48000  # ~3 s
 
 
 def _rms(audio_bytes: bytes) -> float:
@@ -114,10 +122,11 @@ class Session:
         self.feed_tail = ""
         self.openmic_ayah_start = 0
         self._om_scanning = False
-        self._om_last_attempt = None
         self._om_ticks_at_attempt = -STALL_ADVANCE_TICKS
         self._tick_cnt = 0
         self._stall_ticks = 0
+        self._burst_start = None
+        self._last_phrase_feed = 0
         self._gate_silence = False
         self._rms_n = 0
         self._rms_sum = 0.0
@@ -221,14 +230,23 @@ class Session:
                 if not self._gate_silence:
                     self._gate_silence = True
                     print(f"🔇 [ENERGY GATE] silence beat (rms={rms:.0f}): decode skipped")
+                    # Burst ended: lock the whole spoken phrase with a CLEAN
+                    # full-context decode (recovers words the chopped strip
+                    # mangled or clipped at the burst's start).
+                    await self._feed_openmic_phrase(burst_end=True)
             else:
                 if self._gate_silence:
                     self._gate_silence = False
                     print(f"🔊 [ENERGY GATE] speech beat (rms={rms:.0f}): decoding resumed")
+                n = len(self.audio)
+                if self._burst_start is None:
+                    # Approximate the burst start at the head of this delta so
+                    # a burst-end phrase decode can still recover the first
+                    # word even when the mic clipped it from the snippet.
+                    self._burst_start = max(0, n - new_samples * 2)
                 # Phase A: decode the trailing context window, emit only the
                 # newly-covered frames (frame-index slicing + LEAD lookahead
                 # + collapse carryover inside decode_live_window).
-                n = len(self.audio)
                 start = max(0, n - LIVE_WINDOW_SAMPLES)
                 window = bytes(self.audio[start:])
                 new_frames = int(round(new_samples / CTC_STRIDE))
@@ -239,6 +257,10 @@ class Session:
                 self._win_started = True
                 self.stream_pred_raw += tok
                 self.feed_tail += tok
+                if len(self.audio) - self._last_phrase_feed >= PHRASE_REDECODE_BYTES:
+                    # Long uninterrupted burst: keep the phrase pointers
+                    # moving mid-burst instead of waiting for the end.
+                    await self._feed_openmic_phrase()
 
         if self.mode in ("single", "surah") and self.guided is not None:
             self.guided.feed(tok)
@@ -315,9 +337,9 @@ class Session:
         newly = self.guided.confirm()
         self._merge_newly(newly)
         self.resolving_sent = False
-        self._om_last_attempt = None
         self._om_ticks_at_attempt = -STALL_ADVANCE_TICKS
         self._stall_ticks = 0
+        self._burst_start = None
         self.feed_tail = ""
         if not is_first:
             self.openmic_ayah_start = len(self.audio)
@@ -329,48 +351,45 @@ class Session:
             print(f"🔍 [ADVANCE] skip: scanning={self._om_scanning} "
                   f"resolved={self.resolved} guided={self.guided is not None}")
             return
-        # Resolve on the RECENT tokens only: the full feed_tail is polluted with
-        # the previous ayah's stream and would match it again. Size the window
-        # from the current ayah's expected length so a following ayah of the
-        # same class fits.
-        try:
-            cur = TAJWEED_ONLY_INDEX[self.surah_id][self.ayah_id]["expected_full"]
-            window_len = max(MIN_ADVANCE_WINDOW_TOKENS, 2 * len(strip_diacritics(cur)))
-        except Exception:
-            window_len = MIN_ADVANCE_WINDOW_TOKENS
-        tail = self.feed_tail[-window_len:] if window_len > 0 else ""
-        clean = self._clean_openmic_tail(tail)
-        if len(clean) < MIN_RESOLVE_TOKENS:
-            print(f"🔍 [ADVANCE] need-more-tokens: clean={len(clean)}")
-            return
-        # Cooldown: retry when the window has grown by at least one token OR
-        # STALL_ADVANCE_TICKS beats have passed since the last attempt. The
-        # recent-window is capped, so an absolute "+5 tokens" rule (the old
-        # guard) permanently locked the advance out at clean≈46.
-        grew = self._om_last_attempt is None or len(clean) > self._om_last_attempt
+        # Cooldown: at most one attempt per STALL_ADVANCE_TICKS beats. Each
+        # attempt is a self-contained fresh decode of the recent audio, so the
+        # old "did the token window grow?" guard is meaningless here.
         beats = self._tick_cnt - self._om_ticks_at_attempt
-        if not grew and beats < STALL_ADVANCE_TICKS:
-            print(f"🔍 [ADVANCE] cooldown: clean={len(clean)} last={self._om_last_attempt} "
-                  f"beats={beats}")
+        if beats < STALL_ADVANCE_TICKS:
+            print(f"🔍 [ADVANCE] cooldown: beats={beats}")
             return
         self._om_scanning = True
-        self._om_last_attempt = len(clean)
         self._om_ticks_at_attempt = self._tick_cnt
+        decode_str = ""
         try:
-            # Match-from-anywhere alignment (see advance_target) so a tail that
-            # starts mid-ayah can still anchor the NEXT ayah. resolve_ayah's
-            # prefix trie cannot do this, which is why live advance kept failing
-            # even when the correct ayah's tokens were sitting in the tail.
+            end = len(self.audio)
+            start = max(0, end - STALL_DECODE_SAMPLES)
+            if end - start < MIN_PHRASE_BYTES:
+                print(f"🔍 [ADVANCE] need-more-audio: bytes={end - start}")
+                return
+            # A: fresh phrase-level decode of the RECENT AUDIO (the same
+            # one-shot signal as the final's evaluate_audio) instead of the
+            # chopped 0.5 s-slice strip, which our offline experiment measured
+            # as the weakest representation and never aligned within budget.
+            decode_str = await asyncio.to_thread(
+                _bytes_to_prediction, bytes(self.audio[start:end])
+            )
+            clean = self._clean_openmic_tail(decode_str)
+            if len(clean) < MIN_RESOLVE_TOKENS:
+                print(f"🔍 [ADVANCE] need-more-tokens: clean={len(clean)}")
+                return
+            # Match-from-anywhere alignment (see advance_target) so a window
+            # that starts mid-ayah can still anchor the NEXT ayah.
+            # resolve_ayah's prefix trie cannot do this, which is why the old
+            # strip-based live advance kept failing even when the correct
+            # ayah's tokens were sitting in the tail.
             res = await asyncio.to_thread(
                 advance_target, clean, self.surah_id, self.ayah_id, self.allowed_surahs
             )
         finally:
             self._om_scanning = False
-        # Whatever the outcome, drop the stale (previous-ayah) prefix now so the
-        # window keeps sliding toward the most recent tokens on the next try.
-        self.feed_tail = tail
         if res is None:
-            print(f"🔍 [ADVANCE] resolve=None (ambiguous/insufficient) tail={tail[-24:]!r}")
+            print(f"🔍 [ADVANCE] resolve=None (ambiguous/insufficient) decode={decode_str[-32:]!r}")
             return
         s, a, score = res
         # advance_target can only emit later ayahs, but keep the guard as
@@ -379,7 +398,44 @@ class Session:
             print(f"🔍 [ADVANCE] blocked: winner={(s, a)} <= current={(self.surah_id, self.ayah_id)} "
                   f"score={score}")
             return
+        print(f"🔍 [ADVANCE] commit: {(s, a)} score={score}")
         await self._commit_openmic(s, a, score)
+
+    async def _feed_openmic_phrase(self, burst_end=False):
+        """B (smooth in-ayah): phrase-level full-context decode of the current
+        speech burst, fed to the guided trie so words lock from a CLEAN decode
+        (not the chopped strip). Called at burst end (silence transition,
+        burst_end=True) and every PHRASE_REDECODE_BYTES of new speech during a
+        long burst (burst_end=False, the burst stays open so the final tail is
+        still re-decoded at the real end)."""
+        if self.mode != "open_mic" or self.resolved is None or self.guided is None:
+            return
+        b = self._burst_start
+        if b is None:
+            return
+        end = len(self.audio)
+        if end - b < MIN_PHRASE_BYTES:
+            return
+        # Decode the burst (or the new audio since the last feed plus a small
+        # overlap for cross-word context). One full-context pass per burst so
+        # the trie sees the same high-quality signal the final uses.
+        start = max(b, self._last_phrase_feed - MIN_PHRASE_BYTES)
+        if end - start < MIN_PHRASE_BYTES:
+            start = max(0, end - MIN_PHRASE_BYTES)
+        if end - start < MIN_PHRASE_BYTES:
+            return
+        phrase = await asyncio.to_thread(
+            _bytes_to_prediction, bytes(self.audio[start:end])
+        )
+        if burst_end:
+            self._burst_start = None
+        self._last_phrase_feed = end
+        self.guided.feed(phrase)
+        newly = self.guided.confirm()
+        if newly:
+            self._stall_ticks = 0
+            self._merge_newly(newly)
+            await self._send_interim()
 
     def _merge_newly(self, newly):
         if self.mode == "single":
