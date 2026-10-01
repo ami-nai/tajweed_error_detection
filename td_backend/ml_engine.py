@@ -339,12 +339,41 @@ def decode_live_window(window_bytes: bytes, new_frames: int, prev, is_first: boo
     return _collapse_pred_ids(ids[lo:hi], prev)
 
 
+def _load_audio_bytes(audio_path: str) -> bytes:
+    """Load an audio FILE as 16 kHz mono 16-bit PCM bytes (training parity).
+
+    Real container files (WAV/MP3/M4A at any rate/channels — e.g. the 48 kHz
+    stereo phone recording): decoded with soundfile, mixed to mono, resampled
+    to 16 kHz via torchaudio (already a dependency), peak-normalized to 0.95
+    exactly like training's load_audio_safely, then int16-encoded.
+    Headerless raw temp segments (what main.py writes: bare int16 mono 16 kHz
+    bytes with a .wav suffix): soundfile raises, so fall back to a raw read —
+    bit-identical to the old behavior. The live socket path never touches this
+    (mic bytes are already 16 kHz mono int16).
+    """
+    try:
+        import soundfile as _sf
+        y, sr = _sf.read(audio_path, dtype="float32")
+    except Exception:
+        with open(audio_path, "rb") as f:
+            return f.read()
+    if y.ndim > 1:
+        y = np.mean(y, axis=1)
+    if sr != 16000:
+        y_t = torch.from_numpy(np.ascontiguousarray(y))
+        y = F.resample(y_t, sr, 16000).numpy()
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    if peak > 0:
+        y = (y / peak) * 0.95
+    pcm = np.clip(np.asarray(y) * 32768.0, -32768, 32767).astype(np.int16)
+    return pcm.tobytes()
+
+
 def _predict_phonemes(audio_path: str) -> str:
-    """Load raw PCM audio and run model inference, returning the decoded
-    phoneme prediction string (shared by evaluate_audio and sequential mode)."""
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-    return _bytes_to_prediction(audio_bytes)
+    """Load an audio file (any rate/channels, or a headerless raw segment)
+    and run model inference, returning the decoded phoneme prediction string
+    (shared by evaluate_audio and sequential mode)."""
+    return _bytes_to_prediction(_load_audio_bytes(audio_path))
 
 
 def DIACRITICS_STRIP():
