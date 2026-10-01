@@ -19,8 +19,12 @@
 # Large files
 **/quran_model_final.pt
 **/quran_model_final-alif-hamja_correction.pt
+**/streaming_quran_wav2vec.pt
+**/streaming_quran_wav2vec (1).pt
+**/vocab.json
+**/vocab (2).json
 **/silero_vad.jit
-**/*.ipynb
+**/*.ipynb_checkpoints/
 **/quran_full_data_collection_new_send.zip
 
 # ==========================================

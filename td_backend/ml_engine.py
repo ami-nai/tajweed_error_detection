@@ -20,20 +20,44 @@ _INFERENCE_LOCK = threading.Lock()
 warnings.filterwarnings("ignore")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Streaming model contract (see half-a-second-stride-training.ipynb + streaming_model_handoff.md):
+# base jonatasgrosman/wav2vec2-large-xlsr-53-arabic, 3 s windows / 0.5 s stride,
+# sorted vocab.json (40 classes), NO trailing zero-pad, extractor per-input norm.
+MODEL_ID = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+MODEL_PATH = os.environ.get("STREAMING_MODEL_PATH", "streaming_quran_wav2vec.pt")
+VOCAB_PATH = os.environ.get("STREAMING_VOCAB_PATH", "vocab.json")
 
-# 1. Model Definition
-class W2V2Light(nn.Module):
 
-    def __init__(self, v_size):
+# 1. Model Definition (notebook Cell 6 verbatim, inference path returns logits)
+class QuranWav2Vec2(nn.Module):
+
+    def __init__(self, model_id, vocab_size):
         super().__init__()
-        self.base = AutoModel.from_pretrained("facebook/wav2vec2-base")
-        self.phoneme_head = nn.Linear(768, v_size)
+        self.base = AutoModel.from_pretrained(model_id)
+        try:
+            self.base.feature_extractor._freeze_parameters()
+        except Exception:
+            pass
+        try:
+            self.base.config.gradient_checkpointing = False
+            self.base.gradient_checkpointing_disable()
+        except Exception:
+            pass
+        self.phoneme_head = nn.Linear(self.base.config.hidden_size, vocab_size)
+        self.ctc_loss = nn.CTCLoss(blank=1, zero_infinity=True)
 
-    def forward(self, x):
-        x = self.base.feature_extractor(x).transpose(1, 2)
-        x = self.base.feature_projection(x)[0]
-        x = self.base.encoder(x).last_hidden_state
-        return self.phoneme_head(x)
+    def forward(self, input_values, attention_mask=None, targets=None, target_lengths=None):
+        outputs = self.base(input_values, attention_mask=attention_mask)
+        logits = self.phoneme_head(outputs.last_hidden_state)
+        if targets is not None:
+            log_probs = logits.transpose(0, 1).log_softmax(2)
+            input_lengths = torch.full(
+                (log_probs.size(1),), log_probs.size(0),
+                dtype=torch.long, device=log_probs.device,
+            )
+            loss = self.ctc_loss(log_probs, targets, input_lengths, target_lengths)
+            return loss.unsqueeze(0), logits
+        return logits
 
 
 # 2. Vocabulary Setup
@@ -62,9 +86,10 @@ class QPSVocabulary:
 
 
 vocab = QPSVocabulary()
+# Aligned to the streaming training notebook (Cell 3): NO ghunnah=4 there.
+# Backend previously had ghunnah=4, which emits tokens the model never saw.
 moshaf_rules = quran_transcript.MoshafAttributes(
     rewaya="hafs",
-    ghunnah=4,
     madd_monfasel_len=4,
     madd_mottasel_len=4,
     madd_mottasel_waqf=5,
@@ -90,32 +115,36 @@ def safe_phonetizer(text, rules):
         except Exception:
             return [c for c in normalized if c not in ' ۚۛۗۖ ۘۜ\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\u0670']
 
-# 4. Determine the model output layer size from the saved checkpoint.
-checkpoint = torch.load("quran_model_final-alif-hamja_correction.pt", map_location="cpu", weights_only=True)
-V_SIZE = checkpoint["phoneme_head.weight"].shape[0]
-print(f"Checkpoint output layer size: {V_SIZE}")
+# 4. Load the exact training vocab (sorted order, ids 0/1 = pad/blank).
+# V_SIZE comes from vocab.json so import stays light on weak machines
+# (no 1.2 GB torch.load, no HF base download); the heavy model loads lazily
+# on first inference (Kaggle GPU). TRAINED_PHONEMES keeps its name so all
+# trie/feedback call sites keep working.
+with open(VOCAB_PATH, "r", encoding="utf-8") as _vf:
+    _saved_vocab = json.load(_vf)
+vocab.clear()
+vocab.phoneme2id = dict(_saved_vocab)
+vocab.id2phoneme = {i: p for p, i in _saved_vocab.items()}
+vocab.idx = max(_saved_vocab.values()) + 1
+TRAINED_PHONEMES = [p for p, i in sorted(_saved_vocab.items(), key=lambda kv: kv[1]) if i >= 2]
+V_SIZE = vocab.idx
+print(f"Streaming vocab: {V_SIZE} classes from {VOCAB_PATH} (expect 40)")
 
-# 4. Build Tajweed Index and populate Vocabulary
+
+def _ayah_phonetize_text(s_id: int, a_id: int, fallback_text: str) -> str:
+    """Training-aligned source text: notebook used Aya(s,a).get().uthmani.
+    Prefer that when the installed quran-transcript data supports it, else fall
+    back to the row text from quran_metadata.json (offline/Kaggle-safe)."""
+    try:
+        return quran_transcript.Aya(s_id, a_id).get().uthmani
+    except Exception:
+        return fallback_text
+
+# 4. Build Tajweed Index with the training-aligned phonetizer rules.
 TAJWEED_ONLY_INDEX = {}
 print("Loading Tajweed index...")
 with open("quran_metadata.json", "r", encoding="utf-8") as f:
     data = json.load(f)
-
-    # 1. Full training vocabulary in exact order.
-    # CRITICAL: This is the EXACT order the checkpoint was trained with, extracted
-    # by replaying the training notebook's dataset build (uthmani_script +
-    # moshaf_rules above + audio-presence filter) on quran_full_data_collection_new.
-    # 2 base classes <pad>,<blank> + 37 phoneme tokens = 39 classes = checkpoint head.
-    TRAINED_PHONEMES = ['ت', 'َ', 'ب', ' ', 'ي', 'د', 'ا', 'ء', 'ِ', 'ۦ', 'ل', 'ه', 'ن', 'و', 'ڇ', 'م', 'غ', 'ع', 'ُ', 'ك', 'س', 'ص', 'ر', 'ذ', 'أ', 'ح', 'ة', 'ط', 'ف', 'ج', 'ق', 'ۥ', 'ں', 'ش', 'خ', 'ث', 'إ']
-
-    # 2. Reset vocab and keep only the classes the checkpoint actually supports
-    vocab.clear()
-    for token in TRAINED_PHONEMES[: V_SIZE - 2]:
-        vocab.add(token)
-
-    # 3. Safety Padding to forcefully protect model dimensions against runtime array variance
-    while len(vocab) < V_SIZE:
-        vocab.add(f"<dummy_pad_{len(vocab)}>")
 
     # 3. Run the startup indexer using full-ayah phonetization (same as training)
     for row in data:
@@ -126,8 +155,11 @@ with open("quran_metadata.json", "r", encoding="utf-8") as f:
         raw_text = row["ayah_ar"]
         words = raw_text.split()
 
-        # Full-ayah phonetization (in-context cross-word rules preserved)
-        full_phonemes = safe_phonetizer(raw_text, moshaf_rules)
+        # Full-ayah phonetization (in-context cross-word rules preserved).
+        # Phonetize the training-aligned text (Aya uthmani when available);
+        # display words stay from the metadata row so the UI text is unchanged.
+        phon_text = _ayah_phonetize_text(s_id, a_id, raw_text)
+        full_phonemes = safe_phonetizer(phon_text, moshaf_rules)
         full_stream = "".join(full_phonemes)
         segments = full_stream.split()
 
@@ -149,33 +181,65 @@ with open("quran_metadata.json", "r", encoding="utf-8") as f:
 # Remove empty surahs
 TAJWEED_ONLY_INDEX = {k: v for k, v in TAJWEED_ONLY_INDEX.items() if v}
 
-# 5. Load Model Weights
-print(f"Loading Model... Target architectural output layer size: {V_SIZE}")
-# Fixed parameter layout error by passing positional argument matching W2V2Light constructor definition
-model = W2V2Light(V_SIZE).to(DEVICE)
-model.load_state_dict(checkpoint, strict=False)
-model.eval()
+# 5. Lazy model + extractor (Kaggle GPU). Import stays light: no 1.2 GB
+# checkpoint read and no HF download until the first real inference, so weak
+# machines can still import, build the index, and run stubbed smoke tests.
+_MODEL = None
+_EXTRACTOR = None
 
-extractor = AutoFeatureExtractor.from_pretrained("facebook/wav2vec2-base")
+
+def _ensure_model():
+    """Load base + streaming head on first use (strict: hide nothing)."""
+    global _MODEL, _EXTRACTOR
+    if _MODEL is not None and _EXTRACTOR is not None:
+        return _MODEL, _EXTRACTOR
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Streaming checkpoint not found: {MODEL_PATH}. "
+            "On Kaggle, copy it from the attached ami0nai/quran-model "
+            "as streaming_quran_wav2vec.pt (see deploy_colab.py)."
+        )
+    from transformers import AutoFeatureExtractor as _AFE
+    _EXTRACTOR = _AFE.from_pretrained(MODEL_ID)
+    _MODEL = QuranWav2Vec2(MODEL_ID, V_SIZE).to(DEVICE)
+    _ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+    _state = _ckpt.get("model_state_dict", _ckpt) if isinstance(_ckpt, dict) else _ckpt
+    _head = _state.get("phoneme_head.weight", None) if isinstance(_state, dict) else None
+    if _head is not None and _head.shape[0] != V_SIZE:
+        raise RuntimeError(
+            f"Head mismatch: checkpoint {_head.shape[0]} vs vocab {V_SIZE}"
+        )
+    _MODEL.load_state_dict(_state, strict=True)
+    _MODEL.eval()
+    print(f"Streaming model loaded: {MODEL_ID} head={V_SIZE} on {DEVICE}")
+    return _MODEL, _EXTRACTOR
+
+
+# Back-compat for any external probe touching ml_engine.model / extractor.
+model = None
+extractor = None
 
 
 def _detect_ctc_stride() -> int:
-    """Samples-per-output-frame from the loaded wav2vec2 conv stack (product
-    of conv strides; 320 for wav2vec2-base). Computed, never hardcoded, so a
-    future backbone swap can't silently break frame-index slicing."""
+    """Samples-per-output-frame from the wav2vec2 conv stack (320 for both
+    wav2vec2-base and xlsr-53). Introspects the loaded model when available,
+    else the verified constant so import never triggers a download."""
     try:
+        m, _ = _ensure_model()
         prod = 1
-        for layer in model.base.feature_extractor.conv_layers:
+        for layer in m.base.feature_extractor.conv_layers:
             prod *= layer.conv.stride[0]
         return int(prod)
     except Exception as exc:
-        print(f"⚠️ [CTC STRIDE] introspection failed ({exc}); falling back to 320")
+        print(f"⚠️ [CTC STRIDE] using 320 (model not loaded yet: {exc})")
         return 320
 
 
-CTC_STRIDE = _detect_ctc_stride()
-CTC_PAD_SAMPLES = 4800  # trailing zero-pad appended to every inference input
-CTC_PAD_FRAMES = CTC_PAD_SAMPLES // CTC_STRIDE
+CTC_STRIDE = 320
+# Training never saw trailing zero-pad: pad=0 is the contract. Keep the
+# frames math intact (0 // stride == 0) so decode_live_window needs no branch.
+CTC_PAD_SAMPLES = 0
+CTC_PAD_FRAMES = 0
 print(f"CTC stride: {CTC_STRIDE} samples/frame, pad frames: {CTC_PAD_FRAMES}")
 
 
@@ -185,28 +249,26 @@ def _infer_pred_ids(audio_bytes: bytes) -> list:
     of _bytes_to_prediction so overlapped-window live decoding can slice ids
     at frame boundaries BEFORE collapse (see Phase A) instead of diffing
     decoded text after the fact."""
+    m, ext = _ensure_model()
     # 1. Convert raw bytes to numpy array (16-bit PCM)
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
     audio_np /= 32768.0
 
-    waveform = torch.from_numpy(audio_np).unsqueeze(0)  # Shape: (1, samples)
-    waveform_padded = torch.nn.functional.pad(
-        waveform, (0, 4800), mode="constant"
-    )
-
-    inputs = (
-        extractor(
-            waveform_padded.squeeze().numpy(),
-            sampling_rate=16000,
-            return_tensors="pt",
-        )
-        .input_values.to(DEVICE)
-    )
+    # No trailing pad: the streaming model was trained on exact 3 s windows
+    # with no zero-pad (pad=0 contract). The extractor applies the same
+    # per-input zero-mean/unit-variance norm as training.
+    inputs = ext(
+        audio_np,
+        sampling_rate=16000,
+        return_tensors="pt",
+    ).input_values.to(DEVICE)
 
     # Inference
     with _INFERENCE_LOCK:
         with torch.no_grad():
-            logits = model(inputs)
+            logits = m(inputs)
+            if isinstance(logits, (tuple, list)):
+                logits = logits[-1]
             pred_ids = torch.argmax(logits[0], dim=-1)
 
     return [p.item() for p in pred_ids]
@@ -214,7 +276,7 @@ def _infer_pred_ids(audio_bytes: bytes) -> list:
 
 def _collapse_pred_ids(pred_ids, prev_in=None):
     """CTC Decode: collapse adjacent duplicates FIRST (preserves madd/long vowels),
-    THEN remove blanks/pads. Matches notebook training decode (cell 13).
+    THEN remove blanks/pads. Matches the streaming notebook decode.
 
     prev_in threads the collapse state across slice boundaries: a phoneme
     spanning a cut must not be emitted twice. Returns (text, prev_out) where
@@ -228,7 +290,7 @@ def _collapse_pred_ids(pred_ids, prev_in=None):
             prev = None  # break adjacency across blanks
             continue
         token_str = vocab.id2phoneme.get(token_id, "")
-        if token_str and not token_str.startswith("<dummy_pad"):
+        if token_str:
             if token_str != prev:
                 final_pred.append(token_str)
             prev = token_str
@@ -356,12 +418,14 @@ def _is_diacritic(ch):
 def _is_feedback_char(ch):
     """True if a character in the reference can actually be verified by the model.
 
-    Only tokens in the trained vocabulary (consonants + emittable harakat like
-    َ ِ ُ ۦ ۥ) are reportable. Marks the model can never output (sukun, shadda,
-    tanween, maddah, superscript alif, waqf marks) and consonants outside the
-    vocab (e.g. ظ ض ز) are excluded so we never accuse the user of untestable
-    mistakes.
+    Only tokens in the streaming vocab are reportable. The special token `۾`
+    is excluded (never accuse the user on a control symbol); `ز/ض/ظ` are now
+    reportable since the streaming model emits them (old 39-class model could
+    not). Marks outside the vocab (sukun, shadda, tanween, maddah, waqf, and
+    the retired `أ/ة/إ`) stay excluded.
     """
+    if ch == "۾":
+        return False
     return ch in TRAINED_PHONEMES
 
 
@@ -375,7 +439,9 @@ def _assign_letters(display_text, consonant_statuses):
     letters = []
     cidx = 0
     for ch in display_text:
-        if _is_diacritic(ch):
+        if ch == "۾":
+            letters.append({"ch": ch, "status": "neutral"})
+        elif _is_diacritic(ch):
             letters.append({"ch": ch, "status": "neutral"})
         elif ch in TRAINED_PHONEMES:
             status = consonant_statuses[cidx] if cidx < len(consonant_statuses) else "miss"

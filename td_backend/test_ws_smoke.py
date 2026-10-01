@@ -390,11 +390,17 @@ async def _frame_stride_probe():
 
 
 async def _windowed_decode_emits_only_new_tail():
-    # Phase A slicing with stubbed frame ids (2='ت' 3='َ' 4='ب' 1=blank):
-    # consecutive windows tile exactly, and the collapse carryover suppresses
-    # a boundary duplicate that a fresh collapse would emit twice.
-    ids1 = [2] * 10 + [1] * 10 + [3] * 10 + [1] * 10  # 40 frames
-    ids2 = ids1 + [4] * 10                             # 50 frames
+    # Phase A slicing with stubbed frame ids (vocab-agnostic: look up ت/َ/ب,
+    # 1=blank): consecutive windows tile exactly, and the collapse carryover
+    # suppresses a boundary duplicate that a fresh collapse would emit twice.
+    _T = ml_engine.vocab.phoneme2id["ت"]
+    _A = ml_engine.vocab.phoneme2id["َ"]
+    _B = ml_engine.vocab.phoneme2id["ب"]
+    # Runs placed so the pad=0 slices ([0:24], [24:34], [34:44] with lead=16)
+    # tile exactly: T crosses the first cut (proves carryover suppression),
+    # A sits fully inside the third slice.
+    ids1 = [1] * 20 + [_T] * 10 + [1] * 10  # 40 frames
+    ids2 = ids1 + [_A] * 10                             # 50 frames
     ids3 = ids2 + [1] * 10                             # 60 frames
     frames = iter([ids1, ids2, ids3])
     original_infer = ml_engine._infer_pred_ids
@@ -407,7 +413,7 @@ async def _windowed_decode_emits_only_new_tail():
         ml_engine._infer_pred_ids = original_infer
     assert o1 == "ت", repr(o1)
     # Without the carryover this slice would re-emit "ت" (prove the test bites):
-    assert ml_engine._collapse_pred_ids(ids2[9:19])[0] == "ت"
+    assert ml_engine._collapse_pred_ids(ids2[24:34])[0] == "ت"
     assert o2 == "", repr(o2)
     assert p2 is None
     assert o3 == "َ", repr(o3)

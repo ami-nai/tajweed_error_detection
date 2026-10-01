@@ -38,15 +38,19 @@ MIN_RESOLVE_TOKENS = 5
 # assume the user has moved on and re-resolve the ayah on a recent-token window.
 STALL_ADVANCE_TICKS = 3
 # Phase A live decode: each speech beat decodes this trailing context window
-# (3 s) and emits only the newly-covered frames (see decode_live_window).
+# (3 s, exactly the streaming training window) and emits only the
+# newly-covered frames (see decode_live_window).
 # Right-context lookahead in frames: the emitted slice always ends this far
-# before the inference pad.
+# before the newest audio so no emitted frame decodes with "silence ahead".
+# (No trailing zero-pad: the streaming model never saw padding.)
 LIVE_WINDOW_SAMPLES = 48000
 LIVE_LEAD_FRAMES = 16
 # Phrase-level decisions (advance + in-ayah smooth follow) decode the trailing
 # audio in ONE full-context pass instead of the chopped 0.5 s-slice strip,
 # which our offline experiment measured as the weakest signal class.
-STALL_DECODE_SAMPLES = LIVE_WINDOW_SAMPLES + 16000  # ~4 s of audio
+# Capped at 3 s: the streaming model was trained on exactly-3 s windows, so
+# longer one-pass decodes are out-of-contract (verify on Kaggle before raising).
+STALL_DECODE_SAMPLES = LIVE_WINDOW_SAMPLES  # ~3 s of audio
 # Smallest speech burst worth a phrase-level decode (0.5 s at 16 kHz).
 MIN_PHRASE_BYTES = 8000
 # Mid-burst phrase re-decode cadence: bytes of NEW speech since the last feed
@@ -314,13 +318,12 @@ class Session:
 
     def _clean_openmic_tail(self, src=None):
         source = src if src is not None else self.feed_tail
-        # Keep only canonical Arabic letters/digits, space, and the four live
-        # harakat (fatHa, Damma, Kasra, sukun + dagger/khandaq hints). ۦ (and
-        # any other junk token the model occasionally emits) is NOT a real
-        # tashkeel: it must never reach the ayah matcher.
+        # Keep streaming-vocab tokens only: Arabic letters/digits, space, live
+        # harakat (َ ُ ِ ّ ْٰٓ) and the model-emitted marks (ڇ ں ۥ ۦ).
+        # The special token ۾ must never reach the ayah matcher.
         return "".join(
             c for c in source
-            if c in " " or c.isalnum() or c in "َُِّْٰٓ"
+            if c != "۾" and (c in " " or c.isalnum() or c in "َُِّْٰٓڇںۥۦ")
         )
 
     async def _commit_openmic(self, s, a, score):
