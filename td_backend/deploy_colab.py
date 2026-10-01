@@ -5,19 +5,24 @@ free ngrok tunnel so that a Flutter release APK on any device can reach it.
 KAGGLE SETUP (do once):
   1. New Kaggle Notebook with GPU ON (Settings -> Accelerator -> GPU T4),
      Internet ON.
-  2. Add secret: Add-ons -> Secrets -> key `NGROK_TOKEN`, value = your
+  2. Add secret: Add-ons -> Secrets -> key `NGROK_AUTHTOKEN`, value = your
      ngrok authtoken (free at https://ngrok.com, email only). Enable
-     'Notebook access'.
+     'Notebook access' for this notebook.
   3. Attach model: Add Input -> Models -> `ami0nai/quran-model` (has
      `streaming_quran_wav2vec (1).pt` + `vocab (2).json`).
   4. In a cell:
         !git clone --depth 1 --branch stream https://github.com/ami-nai/tajweed_error_detection.git _repo
-        %run _repo/tajweed_detect_app/td_backend/deploy_colab.py --kaggle-model
+        %run _repo/td_backend/deploy_colab.py --kaggle-model
      Or with Drive files:
         %run deploy_colab.py --models "/content/drive/MyDrive/tajweed_models"
   5. The notebook prints a PUBLIC wss URL. Build the APK locally with:
         flutter build apk --release --dart-define=BACKEND_URL=<wss-url>
      Stop ngrok on the laptop first (free accounts allow one agent session).
+
+NOTE: run this script ONCE per session. Re-running it launches a second
+download + second server. If a run hangs, stop the cell, kill leftovers
+(!ps aux | grep -E "from_pretrained|uvicorn" | grep -v grep, then !kill),
+and re-run — deps and HF weights are cached, so the second run is fast.
 
 NOTES / CAVEATS
   * Kaggle sessions die after ~9-12h or 30 min idle; the URL changes on re-run.
@@ -35,6 +40,7 @@ import time
 
 REPO = "https://github.com/ami-nai/tajweed_error_detection.git"
 BRANCH = "stream"
+HF_MODEL_ID = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
 
 # Files that are gitignored and MUST be supplied at runtime (Kaggle model
 # attachment or --models dir). Spaced Kaggle names are accepted and renamed
@@ -74,15 +80,22 @@ def _find_candidate(dirs, names):
 
 def prepare(models_dir=None, use_kaggle_model=False):
     print("== Preparing repository & models ==", flush=True)
-    if not os.path.isdir("td_backend"):
+    if os.path.isfile("main.py") and os.path.isfile("ml_engine.py"):
+        # Already inside td_backend (e.g. %run _repo/td_backend/deploy_colab.py
+        # leaves cwd at /kaggle/working, but a re-run lands here). Skip the
+        # re-clone entirely so a second run never competes with the first.
+        print("Already in td_backend, skipping clone.", flush=True)
+    elif not os.path.isdir("td_backend"):
         run(f"git clone --depth 1 --branch {BRANCH} {REPO} _dep_repo")
-        # Repo root contains tajweed_detect_app/; support both layouts.
+        # Repo root IS the app root; support both layouts defensively.
         inner = os.path.join("_dep_repo", "tajweed_detect_app", "td_backend")
         outer = os.path.join("_dep_repo", "td_backend")
         src = inner if os.path.isdir(inner) else outer
         shutil.move(src, "td_backend")
         shutil.rmtree("_dep_repo", ignore_errors=True)
-    os.chdir("td_backend")
+        os.chdir("td_backend")
+    else:
+        os.chdir("td_backend")
 
     search_dirs = []
     if models_dir:
@@ -126,40 +139,101 @@ def prepare(models_dir=None, use_kaggle_model=False):
     print("Models OK.", flush=True)
 
 
+def _prefetch_hf_base():
+    """Ensure the HF base weights are cached. snapshot_download is a fast
+    no-op when the cache is warm (shows a progress bar only while actually
+    downloading), unlike the old blind from_pretrained call that sat silent
+    — and hung when two copies ran concurrently. Returns True if usable."""
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        run("pip install -q huggingface_hub")
+        from huggingface_hub import snapshot_download
+    try:
+        snapshot_download(HF_MODEL_ID)
+        print("HF base cached.", flush=True)
+        return True
+    except Exception as exc:
+        print(f"WARNING: HF prefetch failed ({exc}); continuing anyway — "
+              "the first tick will download on demand.", flush=True)
+        return False
+
+
 def serve(port):
     print(f"== Installing Python deps (GPU Kaggle) ==", flush=True)
     run("pip install -q -r requirements-colab.txt")
     # Prefetch the HF base once so the first tick doesn't pay the download.
-    run("python -q -c \"from transformers import AutoFeatureExtractor, AutoModel; "
-        "AutoFeatureExtractor.from_pretrained('jonatasgrosman/wav2vec2-large-xlsr-53-arabic'); "
-        "AutoModel.from_pretrained('jonatasgrosman/wav2vec2-large-xlsr-53-arabic')\"")
+    # Foreground + progress bar: if this line sits with no output, it is
+    # genuinely downloading (~1.2 GB, one-time). Never run this script twice
+    # concurrently — two downloads fight over the cache lock and both stall.
+    _prefetch_hf_base()
 
     print(f"== Starting uvicorn on port {port} ==", flush=True)
-    cmd = ("nohup uvicorn main:app --host 0.0.0.0 --port %d "
-           "> server.log 2>&1 &") % port
-    run(cmd)
+    # A stale server from a previous run holds the port and confuses the
+    # wait loop — refuse to double-start instead of hanging.
+    try:
+        import socket as _sock
+        _probe = _sock.socket()
+        _probe.settimeout(2)
+        _probe.connect(("127.0.0.1", port))
+        _probe.close()
+        print(f"Port {port} already serves something (previous run?). "
+              "Reusing it; skipping uvicorn start.", flush=True)
+    except Exception:
+        cmd = ("nohup uvicorn main:app --host 0.0.0.0 --port %d "
+               "> server.log 2>&1 &") % port
+        run(cmd)
     print("Waiting for server to start (GPU load takes 1-3 min)...", flush=True)
     for _ in range(180):
         time.sleep(2)
-        if "Uvicorn running" in open("server.log").read():
-            print("Server is UP.", flush=True)
-            return
+        try:
+            if "Uvicorn running" in open("server.log").read():
+                print("Server is UP.", flush=True)
+                return
+        except FileNotFoundError:
+            pass
     print("WARNING: server may still be loading. Check server.log", flush=True)
+
+
+def _ngrok_token():
+    """Find the ngrok authtoken: env first (Colab/local), then Kaggle's
+    UserSecretsClient (Kaggle secrets are NOT auto-exported to os.environ,
+    so env-only lookup always fails there)."""
+    token = os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("NGROK_TOKEN")
+    if token:
+        return token
+    try:
+        from kaggle_secrets import UserSecretsClient
+        for key in ("NGROK_AUTHTOKEN", "NGROK_TOKEN"):
+            try:
+                token = UserSecretsClient().get_secret(key)
+            except Exception:
+                token = None
+            if token:
+                os.environ[key] = token
+                return token
+    except Exception:
+        pass
+    return None
 
 
 def tunnel(port):
     print("== Starting ngrok tunnel (free wss:// URL) ==", flush=True)
 
-    token = os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("NGROK_TOKEN")
+    token = _ngrok_token()
     if not token:
         print(
-            "\nERROR: NGROK_AUTHTOKEN secret is not set.\n"
-            "  1. Sign up free at https://ngrok.com (no credit card).\n"
-            "  2. Copy your auth token from the dashboard.\n"
-            "  3. In Colab: left sidebar -> key icon (Secrets) ->\n"
-            "     name `NGROK_AUTHTOKEN`, paste the token, enable\n"
-            "     'Notebook access'.\n"
-            "  4. Re-run this cell.",
+            "\nERROR: ngrok authtoken not found.\n"
+            "  Kaggle: right panel -> Add-ons -> Secrets -> Add Secret,\n"
+            "    key `NGROK_AUTHTOKEN`, value = token from\n"
+            "    https://dashboard.ngrok.com (free, email only), enable\n"
+            "    'Notebook access' for this notebook, Save, re-run.\n"
+            "  Colab/local: set env NGROK_AUTHTOKEN to the same token.\n"
+            "  Workaround (this session only): bridge it manually first:\n"
+            "    from kaggle_secrets import UserSecretsClient\n"
+            "    import os\n"
+            "    os.environ['NGROK_AUTHTOKEN'] = \\\n"
+            "        UserSecretsClient().get_secret('NGROK_AUTHTOKEN')",
             file=sys.stderr,
             flush=True,
         )
