@@ -369,11 +369,21 @@ def _load_audio_bytes(audio_path: str) -> bytes:
     return pcm.tobytes()
 
 
+# Leading digital silence prepended to every final-scoring decode. Gives the
+# conv frontend left context so the span's first phonemes don't fall in the
+# edge-instability zone (measured: file takes starting abruptly lose their
+# opening, e.g. ayah 2's مَا). File-final path only — live tick/phrase decodes
+# never touch this (mic windows always have real left context or overlap).
+FRONT_PAD_SAMPLES = 6400  # ~0.4 s of silence
+
+
 def _predict_phonemes(audio_path: str) -> str:
     """Load an audio file (any rate/channels, or a headerless raw segment)
     and run model inference, returning the decoded phoneme prediction string
-    (shared by evaluate_audio and sequential mode)."""
-    return _bytes_to_prediction(_load_audio_bytes(audio_path))
+    (shared by evaluate_audio and sequential mode). Leading silence pad per
+    FRONT_PAD_SAMPLES; the CTC collapse drops it (blanks), so only edge
+    context changes, never content."""
+    return _bytes_to_prediction(b"\x00" * (FRONT_PAD_SAMPLES * 2) + _load_audio_bytes(audio_path))
 
 
 def DIACRITICS_STRIP():
@@ -492,14 +502,11 @@ def _build_mistakes(word_results, word_data, expected_str, diff, max_msgs=6):
     if not diff or not expected_str or len(word_data) == 0:
         return []
 
-    # Try to map diff characters to expected words via the full stream spacing.
-    # Without word mapping we cannot name the ayah word, so skip char feedback.
-    expected_words = expected_str.split()
-    word_map_ok = len(expected_words) == len(word_data)
-    if not word_map_ok:
-        return []
-
-    # Track words that were not recognized at all.
+    # Map diff characters to expected words via the full stream spacing.
+    # Counts can mismatch: cross-word phonetization occasionally fuses two
+    # words into one stream token (e.g. 111:1's لَهَبٍ+وَتَبَّ). Attribution is
+    # then best-effort (clamped to the last word) rather than silent — the
+    # whole-word misses below never needed the mapping at all.
     missed = {i for i, res in enumerate(word_results) if not res["is_read"]}
 
     mistakes = []
@@ -515,7 +522,7 @@ def _build_mistakes(word_results, word_data, expected_str, diff, max_msgs=6):
             continue
 
         if word_idx >= len(word_data):
-            break
+            word_idx = len(word_data) - 1
 
         if word_idx in missed:
             continue  # whole-word message already covers this ayah word
@@ -551,7 +558,7 @@ def _build_mistakes(word_results, word_data, expected_str, diff, max_msgs=6):
     return mistakes
 
 
-def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
+def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str, pred_str: str | None = None):
     if (
         surah_id not in TAJWEED_ONLY_INDEX
         or ayah_id not in TAJWEED_ONLY_INDEX[surah_id]
@@ -559,7 +566,8 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         return []
 
     word_data = TAJWEED_ONLY_INDEX[surah_id][ayah_id]["words"]
-    pred_str = _predict_phonemes(audio_path)
+    if pred_str is None:
+        pred_str = _predict_phonemes(audio_path)
 
     word_results = []
     expected_parts = []
@@ -690,6 +698,63 @@ def evaluate_audio(surah_id: int, ayah_id: int, audio_path: str):
         "words": word_results,
         "real_text": real_text,
         "expected": expected_str,
+        "predicted": pred_str,
+        "accuracy": round(accuracy, 2),
+        "per": per,
+        "diff": diff,
+        "mistakes": mistakes,
+    }
+
+
+def evaluate_span(surah_id: int, ayah_ids: list[int], audio_path: str,
+                  pred_str: str | None = None):
+    """Authoritative multi-ayah scoring for open-mic finals: ONE shared
+    full-context decode over the whole recited span, per-ayah word results
+    concatenated, span-level accuracy/PER/diff/mistakes. Same dict shape as
+    evaluate_audio, plus `words_by_ayah` so callers can keep single-ayah
+    payload contracts (last ayah's words) while scoring the whole span.
+    Returns None when no span ayah is in the index."""
+    valid = [a for a in ayah_ids
+             if surah_id in TAJWEED_ONLY_INDEX and a in TAJWEED_ONLY_INDEX[surah_id]]
+    if not valid:
+        return None
+    if pred_str is None:
+        pred_str = _predict_phonemes(audio_path)
+    all_words, all_data, words_by_ayah = [], [], {}
+    expected_parts, real_parts = [], []
+    for aid in valid:
+        r = evaluate_audio(surah_id, aid, audio_path, pred_str=pred_str)
+        if not isinstance(r, dict):
+            continue
+        words_by_ayah[aid] = r["words"]
+        all_words += r["words"]
+        all_data += TAJWEED_ONLY_INDEX[surah_id][aid]["words"]
+        expected_parts.append(r["expected"])
+        real_parts.append(r["real_text"])
+    if not all_data:
+        return None
+    expected_span = " ".join(expected_parts)
+    real_span = " ".join(real_parts)
+    dist = Levenshtein.distance(pred_str, expected_span) if expected_span else 0
+    accuracy = max(0, 100 - (dist / len(expected_span) * 100)) if expected_span else 0.0
+    per = round(dist / len(expected_span) * 100, 2) if expected_span else 0.0
+    diff = []
+    for e, h in _align_with_ops(expected_span, pred_str):
+        if e is None:
+            status = "I"
+        elif h is None:
+            status = "D"
+        elif e == h:
+            status = "M"
+        else:
+            status = "S"
+        diff.append({"e": e, "h": h, "status": status})
+    mistakes = _build_mistakes(all_words, all_data, expected_span, diff)
+    return {
+        "words": all_words,
+        "words_by_ayah": words_by_ayah,
+        "real_text": real_span,
+        "expected": expected_span,
         "predicted": pred_str,
         "accuracy": round(accuracy, 2),
         "per": per,

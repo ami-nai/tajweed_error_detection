@@ -642,6 +642,132 @@ async def _advance_at_last_ayah_stays_quiet():
     print("LAST-AYAH OK -> no decode, no commit, interim still streams")
 
 
+def _front_pad_prepended_to_final_decodes():
+    # Final-scoring decodes carry leading silence (left context for the span's
+    # first phonemes); live paths must not. Capture the exact bytes reaching
+    # the collapse stage for a headerless raw segment.
+    captured = {}
+    original_btp = ml_engine._bytes_to_prediction
+    ml_engine._bytes_to_prediction = lambda b: (captured.__setitem__("n", len(b)), "")[1]
+    raw = _noise_bytes(32000)  # 1 s of speech-like PCM
+    with open("/tmp/pad_probe.raw", "wb") as f:
+        f.write(raw)
+    try:
+        ml_engine._predict_phonemes("/tmp/pad_probe.raw")
+    finally:
+        ml_engine._bytes_to_prediction = original_btp
+    assert captured.get("n") == len(raw) + ml_engine.FRONT_PAD_SAMPLES * 2, captured
+    print("FRONT-PAD OK -> final decodes lead with silence, content untouched")
+
+
+def _evaluate_audio_accepts_shared_pred():
+    # A precomputed prediction must be used verbatim with zero file I/O or
+    # model calls (lets span scoring share ONE decode across ayahs).
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    original_ppp = ml_engine._predict_phonemes
+
+    def boom(_p):
+        raise AssertionError("decode must not run when pred is supplied")
+
+    ml_engine._predict_phonemes = boom
+    try:
+        r = ml_engine.evaluate_audio(111, 1, "/nonexistent-path", pred_str=exp1)
+    finally:
+        ml_engine._predict_phonemes = original_ppp
+    assert isinstance(r, dict) and r["accuracy"] == 100.0, r.get("accuracy")
+    assert all(w["is_read"] for w in r["words"]), r["words"]
+    assert r["mistakes"] == [], r["mistakes"]
+    print("SHARED-PRED OK -> perfect pred scores 100 with no decode")
+
+
+def _evaluate_span_scores_whole_recitation():
+    # Two committed ayahs, one shared decode: concatenated words, span-level
+    # expected/predicted/accuracy, per-ayah split preserved for payloads.
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    exp2 = ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"]
+    span_pred = exp1 + " " + exp2  # perfect recognition proxy
+    original_ppp = ml_engine._predict_phonemes
+    ml_engine._predict_phonemes = lambda _p: span_pred
+    try:
+        r = ml_engine.evaluate_span(111, [1, 2], "/nonexistent-path")
+    finally:
+        ml_engine._predict_phonemes = original_ppp
+    assert isinstance(r, dict), r
+    assert r["expected"] == exp1 + " " + exp2, r["expected"][-40:]
+    assert r["predicted"] == span_pred
+    assert r["accuracy"] == 100.0 and r["per"] == 0.0, (r["accuracy"], r["per"])
+    assert len(r["words"]) == 5 + 6, len(r["words"])
+    assert sorted(r["words_by_ayah"]) == [1, 2]
+    assert len(r["words_by_ayah"][1]) == 5 and len(r["words_by_ayah"][2]) == 6
+    assert r["mistakes"] == [], r["mistakes"]
+    # Noisy span: ayah 2 wholly unrecognized must hurt, not collapse — and
+    # mistakes must name the damaged words. (Short-word fuzzy rematching is
+    # intended matcher behavior, so the noise here is total, not partial.)
+    noisy = exp1 + " " + "zzzzzzzzzz"
+    ml_engine._predict_phonemes = lambda _p: noisy
+    try:
+        r2 = ml_engine.evaluate_span(111, [1, 2], "/nonexistent-path")
+    finally:
+        ml_engine._predict_phonemes = original_ppp
+    assert 0 < r2["accuracy"] < 100.0, r2["accuracy"]
+    assert r2["mistakes"], "span mistakes must name the damaged words"
+    assert r2["expected"] == exp1 + " " + exp2
+    print("SPAN-SCORE OK -> whole-span metrics, per-ayah words preserved")
+
+
+async def _finalize_open_mic_covers_span():
+    # Two commits (111:1 then 111:2), then Stop: the final must score ayahs
+    # [1, 2] (not just the last), while `words` keeps the last-ayah contract
+    # the app renders.
+    s = _make_session()
+    await s._commit_openmic(111, 1, 0.9)
+    assert s._span_first == (111, 1), s._span_first
+    assert s.openmic_span_start == 0, s.openmic_span_start
+    s.audio.extend(b"\x00\x00" * 8000)
+    await s._commit_openmic(111, 2, 0.85)
+    assert s._span_first == (111, 1), s._span_first  # first commit anchors
+    assert s.ayah_id == 2
+    captured = {}
+    original_eval = main.evaluate_span
+    original_pred = main._predict_phonemes
+    original_adv = main.advance_target
+    main._predict_phonemes = lambda _p: "span-decode"
+    main.advance_target = lambda *a: None  # no further coverage
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    exp2 = ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"]
+
+    def fake_eval(sid, aids, _path, _pred):
+        captured["ayahs"] = (sid, list(aids))
+        return {
+            "words": [],
+            "words_by_ayah": {1: [{"text": "t1", "is_read": True, "letters": []}],
+                              2: [{"text": "t2", "is_read": False, "letters": []}]},
+            "real_text": exp1 + " " + exp2,
+            "expected": exp1 + " " + exp2,
+            "predicted": _pred,
+            "accuracy": 77.0,
+            "per": 23.0,
+            "diff": [],
+            "mistakes": ["m1"],
+        }
+
+    main.evaluate_span = fake_eval
+    try:
+        await s._finalize_open_mic()
+    finally:
+        main.evaluate_span = original_eval
+        main._predict_phonemes = original_pred
+        main.advance_target = original_adv
+    assert captured.get("ayahs") == (111, [1, 2]), captured
+    final = s.ws.sent[-1]
+    assert final["final"] is True and final["detected"] == {"surah_id": 111, "ayah_id": 2}
+    assert final["expected"] == exp1 + " " + exp2
+    assert final["predicted"] == "span-decode"
+    assert final["accuracy"] == 77.0 and final["per"] == 23.0
+    assert [w["text"] for w in final["words"]] == ["t2"], final["words"]
+    print("SPAN-FINAL OK -> scores [1, 2], words keep last-ayah contract")
+
+
 if __name__ == "__main__":
     print("=== SINGLE ===")
     run_single()
@@ -676,4 +802,8 @@ if __name__ == "__main__":
     _advance_shared_opening_picks_correct_ayah()
     _advance_junk_and_tail_only_never_commit()
     asyncio.run(_advance_at_last_ayah_stays_quiet())
+    _front_pad_prepended_to_final_decodes()
+    _evaluate_audio_accepts_shared_pred()
+    _evaluate_span_scores_whole_recitation()
+    asyncio.run(_finalize_open_mic_covers_span())
     print("ALL SMOKE TESTS PASSED")

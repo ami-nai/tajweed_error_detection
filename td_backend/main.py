@@ -9,6 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from ml_engine import (
     TAJWEED_ONLY_INDEX,
     evaluate_audio,
+    evaluate_span,
     get_surah_ayah_ids,
     decode_live_window,
     CTC_STRIDE,
@@ -17,6 +18,7 @@ from ml_engine import (
     advance_target,
     strip_diacritics,
     _bytes_to_prediction,
+    _predict_phonemes,
 )
 
 app = FastAPI()
@@ -128,6 +130,12 @@ class Session:
         self.stream_pred_raw = ""
         self.feed_tail = ""
         self.openmic_ayah_start = 0
+        # Whole-recitation span for the open-mic final: first commit's ayah and
+        # buffer offset. The final scores everything recited (first..last), not
+        # just the last ayah. Live highlighting is unaffected (driven by the
+        # per-ayah trie + interim, never by these markers).
+        self.openmic_span_start = 0
+        self._span_first = None
         self._om_scanning = False
         self._om_ticks_at_attempt = -STALL_ADVANCE_TICKS
         self._tick_cnt = 0
@@ -347,7 +355,11 @@ class Session:
         self._stall_ticks = 0
         self._burst_start = None
         self.feed_tail = ""
-        if not is_first:
+        if is_first:
+            # Anchor the whole-recitation span once: finals score from here.
+            self.openmic_span_start = self.openmic_ayah_start
+            self._span_first = (s, a)
+        else:
             self.openmic_ayah_start = len(self.audio)
         print(f"🎯 [OPEN MIC] Detected: surah {s}, ayah {a} (score={score})")
         await self._send_interim()
@@ -687,7 +699,6 @@ class Session:
             pass
 
     async def _finalize_open_mic(self):
-        full_segment = bytes(self.audio[self.openmic_ayah_start :])
         resolved = self.resolved
 
         if not resolved and self.stream_pred_raw:
@@ -716,19 +727,45 @@ class Session:
             return
 
         s, a = resolved
-        chunk_result = None
-        if full_segment and s in TAJWEED_ONLY_INDEX and a in TAJWEED_ONLY_INDEX.get(s, {}):
+        # Whole-recitation span: score everything since the first commit, not
+        # just the last ayah — so predicted/expected/score cover the same
+        # recitation the user actually gave. Single-commit sessions collapse
+        # to exactly today's behavior (span of one).
+        s0, a0 = self._span_first or resolved
+        full_segment = bytes(self.audio[self.openmic_span_start:])
+        span_result = None
+        covered_last = a
+        if full_segment and s in TAJWEED_ONLY_INDEX:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp.write(full_segment)
                 tmp_path = tmp.name
             try:
-                chunk_result = await asyncio.to_thread(evaluate_audio, s, a, tmp_path)
+                # ONE shared full-context decode for the whole span.
+                pred_span = await asyncio.to_thread(_predict_phonemes, tmp_path)
+                # Multi-ayah coverage: extend past the last commit for ayahs
+                # recited but never stall-committed.
+                if pred_span:
+                    clean_decode = self._clean_openmic_tail(pred_span)
+                    cov = await asyncio.to_thread(
+                        advance_target, clean_decode, s, a, self.allowed_surahs
+                    )
+                    if cov:
+                        covered_last = cov[1]
+                        print(f"📚 [OPEN MIC] final coverage: ayahs {a}..{covered_last}")
+                span_ayahs = [
+                    x for x in get_surah_ayah_ids(s)
+                    if a0 <= x <= covered_last and x in TAJWEED_ONLY_INDEX.get(s, {})
+                ]
+                if span_ayahs:
+                    span_result = await asyncio.to_thread(
+                        evaluate_span, s, span_ayahs, tmp_path, pred_span
+                    )
             finally:
                 os.remove(tmp_path)
 
         words = []
-        if chunk_result:
-            for w in chunk_result.get("words", []):
+        if span_result:
+            for w in span_result.get("words_by_ayah", {}).get(a, []):
                 words.append({"text": w.get("text", ""), "is_read": w.get("is_read", False), "letters": w.get("letters", [])})
         elif s in TAJWEED_ONLY_INDEX and a in TAJWEED_ONLY_INDEX.get(s, {}):
             words = [
@@ -736,27 +773,7 @@ class Session:
                 for w in TAJWEED_ONLY_INDEX[s][a]["words"]
             ]
 
-        # Multi-ayah coverage: the "real transcription" should reflect how far
-        # the user actually recited, not just the last committed ayah. Re-run
-        # the advance matcher over the authoritative decode and extend the
-        # expected text with every later ayah it genuinely matches.
-        covered_last = a
-        decode_str = (chunk_result or {}).get("predicted", "") or self.stream_pred_raw
-        if self.resolved is not None and decode_str:
-            clean_decode = self._clean_openmic_tail(decode_str)
-            cov = await asyncio.to_thread(
-                advance_target, clean_decode, s, a, self.allowed_surahs
-            )
-            if cov:
-                covered_last = cov[1]
-                print(f"📚 [OPEN MIC] final coverage: ayahs {a}..{covered_last}")
-
-        expected = ""
-        if covered_last > a:
-            expected = self._openmic_expected_span(s, a, covered_last)
-        elif chunk_result:
-            expected = chunk_result.get("expected", "")
-
+        expected = span_result.get("expected", "") if span_result else ""
         payload = {
             "mode": "open_mic",
             "final": True,
@@ -764,15 +781,15 @@ class Session:
             "confidence": confidence,
             "words": words,
         }
-        if chunk_result:
+        if span_result:
             payload.update({
                 "real_text": expected,
                 "expected": expected,
-                "predicted": chunk_result.get("predicted", ""),
-                "accuracy": chunk_result.get("accuracy", 0.0),
-                "per": chunk_result.get("per", 0.0),
-                "diff": chunk_result.get("diff", []),
-                "mistakes": chunk_result.get("mistakes", []),
+                "predicted": span_result.get("predicted", ""),
+                "accuracy": span_result.get("accuracy", 0.0),
+                "per": span_result.get("per", 0.0),
+                "diff": span_result.get("diff", []),
+                "mistakes": span_result.get("mistakes", []),
             })
         await self.ws.send_json(payload)
 
