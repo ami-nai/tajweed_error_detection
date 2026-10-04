@@ -7,6 +7,9 @@ import 'measurement_page.dart';
 class RecitationPage extends ConsumerWidget {
   const RecitationPage({Key? key}) : super(key: key);
 
+  /// Surah-mode per-ayah view gate: hidden for now (flip to true to restore).
+  /// State/Next/finals keep working underneath; only the display is gated.
+  static const bool kShowSurahView = false;
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     // Watch everything from our central state system
@@ -170,18 +173,6 @@ class RecitationPage extends ConsumerWidget {
                       ? null
                       : () => notifier.stopReciting(),
                 ),
-                OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                    minimumSize: Size.zero,
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  ),
-                  icon: const Icon(Icons.analytics_outlined, size: 18),
-                  label: const Text('Measurements', style: TextStyle(fontSize: 14)),
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const MeasurementPage()),
-                  ),
-                ),
               ],
             ),
             const SizedBox(height: 16),
@@ -198,7 +189,15 @@ class RecitationPage extends ConsumerWidget {
                   borderRadius: BorderRadius.circular(15),
                 ),
                 child: isSurahMode
-                    ? _buildSurahView(recitationState)
+                    ? (kShowSurahView
+                        ? _buildSurahView(recitationState)
+                        : const Center(
+                            child: Padding(
+                              padding: EdgeInsets.symmetric(vertical: 24.0),
+                              child: Text('Surah view hidden for now',
+                                  style: TextStyle(color: Colors.black54)),
+                            ),
+                          ))
                     : (isOpenMic
                         ? _buildOpenMicCard(recitationState)
                         : _buildSingleAyahWrap(recitationState.words, recitationState.activeWordIndex)),
@@ -217,7 +216,7 @@ class RecitationPage extends ConsumerWidget {
                   children: [
                     if (isSurahMode) ...[
                       Text(
-                        'Surah Average Accuracy: ${recitationState.surahAverage.toStringAsFixed(1)}%',
+                        'Surah Average Correctness: ${recitationState.surahAverage.toStringAsFixed(1)}%',
                         style: TextStyle(
                           fontSize: 20,
                           fontWeight: FontWeight.bold,
@@ -229,13 +228,6 @@ class RecitationPage extends ConsumerWidget {
                         ),
                       ),
                       const SizedBox(height: 6),
-                      if (recitationState.surahPER > 0) ...[
-                        Text(
-                          'Surah PER: ${recitationState.surahPER.toStringAsFixed(1)}%',
-                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.black54),
-                        ),
-                        const SizedBox(height: 6),
-                      ],
                       if (recitationState.currentAyah != 0)
                         Text(
                           'Current Ayah: ${recitationState.currentAyah}',
@@ -243,7 +235,7 @@ class RecitationPage extends ConsumerWidget {
                         ),
                     ] else ...[
                       Text(
-                        'Accuracy: ${recitationState.accuracy.toStringAsFixed(1)}%',
+                        'Correctness: ${recitationState.accuracy.toStringAsFixed(1)}%',
                         style: TextStyle(
                           fontSize: 22,
                           fontWeight: FontWeight.bold,
@@ -254,13 +246,6 @@ class RecitationPage extends ConsumerWidget {
                                   : Colors.redAccent,
                         ),
                       ),
-                      if (recitationState.per > 0) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          'PER: ${recitationState.per.toStringAsFixed(1)}%',
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.black54),
-                        ),
-                      ],
                     ],
                     const SizedBox(height: 12),
                     if (!isSurahMode) ...[
@@ -316,6 +301,22 @@ class RecitationPage extends ConsumerWidget {
                 ),
               ),
 
+            // Thesis edge measurements live on their own screen (bottom).
+            Center(
+              child: OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: const Icon(Icons.analytics_outlined, size: 18),
+                label: const Text('Measurements', style: TextStyle(fontSize: 14)),
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const MeasurementPage()),
+                ),
+              ),
+            ),
+
             const SizedBox(height: 20),
           ],
         ),
@@ -338,36 +339,13 @@ class RecitationPage extends ConsumerWidget {
   }
 
   // Open-mic view: the full surah rendered as ONE continuous word flow (no
-  // per-ayah boxes/chips) with a small ayah-end marker, plus the live raw
-  // phoneme stream underneath.
+  // per-ayah boxes/chips) with a small ayah-end marker. (The live raw
+  // phoneme strip is hidden for now; `livePhonemes` still flows into state.)
   Widget _buildOpenMicCard(RecitationResult state) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildOpenMicFlow(state),
-        const SizedBox(height: 12),
-        const Divider(height: 1),
-        const SizedBox(height: 8),
-        const Text(
-          'Live Predicted Phonemes:',
-          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54),
-        ),
-        const SizedBox(height: 4),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.05),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Directionality(
-            textDirection: TextDirection.rtl,
-            child: SelectableText(
-              state.livePhonemes.isEmpty ? '—' : state.livePhonemes,
-              textAlign: TextAlign.right,
-              style: const TextStyle(fontSize: 18, height: 1.4, fontFamily: 'Amiri'),
-            ),
-          ),
-        ),
       ],
     );
   }
@@ -565,7 +543,6 @@ class RecitationPage extends ConsumerWidget {
           final words = state.surahWords[aId] ?? [];
           final isCurrent = aId == currentAyah;
           final ayahAcc = state.ayahAccuracies[aId];
-          final ayahPer = state.ayahPER[aId];
           return Container(
             margin: const EdgeInsets.symmetric(vertical: 6.0),
             padding: const EdgeInsets.all(10),
@@ -584,7 +561,7 @@ class RecitationPage extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  // Ayah label + (optional) per-ayah accuracy + PER + "read now" flag
+                  // Ayah label + (optional) per-ayah correctness + "read now" flag
                   Directionality(
                     textDirection: TextDirection.ltr,
                     child: Row(
@@ -614,18 +591,12 @@ class RecitationPage extends ConsumerWidget {
                         ],
                         if (ayahAcc != null) ...[
                           Text(
-                            'Acc ${ayahAcc.toStringAsFixed(0)}%',
+                            'Correctness ${ayahAcc.toStringAsFixed(0)}%',
                             style: const TextStyle(
                                 fontSize: 11, color: Colors.black45, fontWeight: FontWeight.w600),
                           ),
                           const SizedBox(width: 8),
                         ],
-                        if (ayahPer != null && ayahPer > 0)
-                          Text(
-                            'PER ${ayahPer.toStringAsFixed(0)}%',
-                            style: const TextStyle(
-                                fontSize: 11, color: Colors.redAccent, fontWeight: FontWeight.w600),
-                          ),
                       ],
                     ),
                   ),
