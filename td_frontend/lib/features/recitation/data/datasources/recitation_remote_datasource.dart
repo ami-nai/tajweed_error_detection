@@ -64,6 +64,14 @@ class RecitationRemoteDataSource {
   StreamSubscription<Uint8List>? _micStreamSubscription;
   bool _channelClosed = false;
 
+  // Thesis round-trip logging (logging only — no behavior change): monotonic
+  // chunk sequence + wall-ms + cumulative bytes. Pair offline with the
+  // server interim's `audio_bytes` offset (T_recv minus T_send of the chunk
+  // covering that offset). Same-device clock throughout, no sync needed.
+  int _micSeq = 0;
+  int _micBytesTotal = 0;
+  final Stopwatch _micSw = Stopwatch();
+
   RecitationRemoteDataSource(this.baseUrl);
 
   // Connects to the WebSocket and starts streaming audio data chunks immediately.
@@ -85,6 +93,11 @@ class RecitationRemoteDataSource {
     await _safeStopRecorder();
 
     _channelClosed = false;
+    _micSeq = 0;
+    _micBytesTotal = 0;
+    _micSw
+      ..reset()
+      ..start();
     _channel = WebSocketChannel.connect(Uri.parse('$baseUrl/ws/recite'));
 
     // 1. Send the identifying target Surah metadata string (with explicit mode)
@@ -111,6 +124,9 @@ class RecitationRemoteDataSource {
         if (_channelClosed) return;
         try {
           _channel?.sink.add(data);
+          _micBytesTotal += data.length;
+          print("🎙️ [MIC SEND] seq=${_micSeq++} ms=${_micSw.elapsedMilliseconds} "
+              "bytes=${data.length} total=$_micBytesTotal");
         } on StateError {
           _channelClosed = true;
           print("⚠️ [WS SINK CLOSED] dropping mic chunks after channel close (logged once)");

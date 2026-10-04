@@ -404,6 +404,14 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           print("📥 [SERVER EVENT RECEIVED]: $event");
           try {
             final Map<String, dynamic> data = jsonDecode(event);
+            // Thesis round-trip logging (logging only): wall-ms + the audio
+            // offset this interim consumed. Pair offline with MIC SEND lines
+            // (T_recv minus T_send of the chunk covering audio_bytes).
+            if (data['final'] != true) {
+              print("📥 [INTERIM RECV] ms=${DateTime.now().millisecondsSinceEpoch} "
+                  "mode=${data['mode']} audio_bytes=${data['audio_bytes']} "
+                  "active_index=${data['active_index']}");
+            }
             _handleServerPayload(data);
           } catch (payloadError) {
             // A single malformed message must never tear down the stream.

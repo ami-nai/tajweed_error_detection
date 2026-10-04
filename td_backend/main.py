@@ -321,6 +321,10 @@ class Session:
                 "mode": "open_mic",
                 "final": False,
                 "live": self.stream_pred_raw,
+                # Thesis round-trip correlation: monotonic consumer offset of
+                # the audio buffer (bytes). App-side only math (T_recv minus
+                # T_send of the chunk covering this offset) — no clock sync.
+                "audio_bytes": self.eval_pos,
             })
         except Exception:
             # Transient send failure: keep the session alive and let the next
@@ -502,6 +506,7 @@ class Session:
                     "ayah_id": self.ayah_id,
                     "words": self.session_words,
                     "active_index": self.guided.active_index if self.guided else None,
+                    "audio_bytes": self.eval_pos,
                 })
             elif self.mode == "surah":
                 target = self.session_ayahs[self.ayah_index]
@@ -514,6 +519,7 @@ class Session:
                     "ayah_order": self.session_ayahs,
                     "words": words_by_ayah,
                     "active_index": self.guided.active_index if self.guided else None,
+                    "audio_bytes": self.eval_pos,
                 })
             elif self.mode == "open_mic":
                 await self.ws.send_json({
@@ -524,6 +530,7 @@ class Session:
                     "words": self.session_words,
                     "live": self.stream_pred_raw,
                     "active_index": self.guided.active_index if self.guided else None,
+                    "audio_bytes": self.eval_pos,
                 })
         except Exception:
             # Transient send failure: keep the session alive and let the next
