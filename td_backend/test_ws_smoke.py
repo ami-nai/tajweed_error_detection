@@ -169,7 +169,7 @@ async def _advance_uses_fresh_audio():
     s.ayah_id = 1
     s._init_guided()
     s.guided._idx = len(s.guided.words)
-    s.audio.extend(b"\x00\x00" * main.STALL_DECODE_SAMPLES)
+    s.audio.extend(b"\x00" * main.STALL_DECODE_BYTES)
     captured = {}
 
     def fake_decode(b):
@@ -181,7 +181,7 @@ async def _advance_uses_fresh_audio():
     main.advance_target = lambda pred, cs, ca, allowed=None: (calls.append(pred), (111, 2, 0.8))[1]
     s._om_ticks_at_attempt = s._tick_cnt - main.STALL_ADVANCE_TICKS
     await s._maybe_advance_openmic()
-    expected_slice = bytes(s.audio[-main.STALL_DECODE_SAMPLES:])
+    expected_slice = bytes(s.audio[-main.STALL_DECODE_BYTES:])
     assert captured.get("bytes") == expected_slice, (len(captured.get("bytes", b"")), len(expected_slice))
     assert len(calls) == 1
     assert calls[0] == "تب لهب وتب ما اغنى عنه ماله وما كسب", calls[0]
@@ -547,6 +547,101 @@ def run_surah():
         print("SURAH STOP OK")
 
 
+def _window_byte_contract():
+    # Regression pin for the samples-vs-bytes unit bug: session.audio is a
+    # bytearray of int16 PCM, so every window must be denominated in BYTES.
+    # The old sample-counted values silently halved every window (3 s -> 1.5 s),
+    # which starved advance_target of the coverage it needs.
+    assert main.LIVE_WINDOW_BYTES == 96000 == 48000 * 2
+    assert main.STALL_DECODE_BYTES == 96000
+    assert main.PHRASE_REDECODE_BYTES == 96000
+    assert main.MIN_PHRASE_BYTES == 16000 == 8000 * 2
+    assert main.MIN_NEW_BYTES == 8000
+    print("WINDOW-BYTES OK -> 3 s windows are true 3 s (96000 B)")
+
+
+def _advance_from_head_only_commits_next():
+    # THE reported stuck case (111:1 -> 111:2): the 3 s window holds the
+    # previous ayah's tail plus ONLY THE HEAD of the next ayah — never the
+    # whole ayah. The prefix pass must commit 111:2 from its head alone.
+    # (Built from stripped streams with exact token counts, like the matcher.)
+    s1 = ml_engine.strip_diacritics(ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"])
+    s2 = ml_engine.strip_diacritics(ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"])
+    body = s1[-8:] + " " + s2[:16]  # ~8 residue + ~16 new tokens
+    res = ml_engine.advance_target(body, 111, 1, {111})
+    assert res is not None, (body, res)
+    assert res[1] == 2, res
+    print("HEAD-ADVANCE OK -> 111:2 commits from its head alone:", res)
+
+
+def _advance_single_token_stays_quiet():
+    # Only ~4 new tokens (barely-started ayah plus previous-ayah residue):
+    # genuinely ambiguous, so no commit — the next retry (1.5 s later, more
+    # tokens) decides instead of guessing.
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    exp2 = ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"]
+    body = exp1[-6:] + " " + exp2[:4]
+    assert ml_engine.advance_target(body, 111, 1, {111}) is None
+    print("SINGLE-TOKEN QUIET OK -> barely-started ayah commits nothing")
+
+
+def _advance_noisy_head_still_commits():
+    # Live mic decode runs ~13% PER (mostly deletions): 1 dropped token out of
+    # ~13 (~8%) must not break the commit. (2+ deletions on a short head is
+    # harsher than measured reality — covered by retries, not asserted here.)
+    s1 = ml_engine.strip_diacritics(ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"])
+    s2 = ml_engine.strip_diacritics(ml_engine.TAJWEED_ONLY_INDEX[111][2]["expected_full"])
+    head = s2[:14]
+    noisy = head[:6] + head[7:]  # simulate 1 deleted token
+    body = s1[-10:] + " " + noisy
+    res = ml_engine.advance_target(body, 111, 1, {111})
+    assert res is not None and res[1] == 2, (body, res)
+    print("NOISY-HEAD OK -> 1 deletion tolerated, still 111:2:", res)
+
+
+def _advance_shared_opening_picks_correct_ayah():
+    # 113:4 and 113:5 share the two-word opening 'وَمِن شَرِّ': reading ayah 4
+    # must commit 4 (not furthest-win 5) — the 12-token head must diverge.
+    exp3 = ml_engine.TAJWEED_ONLY_INDEX[113][3]["expected_full"]
+    exp4 = ml_engine.TAJWEED_ONLY_INDEX[113][4]["expected_full"]
+    body = exp3[-8:] + " " + exp4[:16]
+    res = ml_engine.advance_target(body, 113, 3, {113})
+    assert res is not None and res[1] == 4, (body, res)
+    print("SHARED-HEAD OK -> 113:4 wins over 113:5 on shared opening:", res)
+
+
+def _advance_junk_and_tail_only_never_commit():
+    # Junk matches nothing; ayah-1-only tail must not invent ayah 2.
+    assert ml_engine.advance_target("zzzz zzzz", 111, 1, {111}) is None
+    exp1 = ml_engine.TAJWEED_ONLY_INDEX[111][1]["expected_full"]
+    assert ml_engine.advance_target(exp1, 111, 1, {111}) is None
+    print("NO-FALSE-ADVANCE OK -> junk / previous-ayah-only commits nothing")
+
+
+async def _advance_at_last_ayah_stays_quiet():
+    # Terminal ayah: no later ayah exists, so the attempt must short-circuit
+    # (no wasted GPU forward) and log once instead of retrying forever.
+    s = _make_session()
+    last = max(ml_engine.get_surah_ayah_ids(111))
+    s.resolved = (111, last)
+    s.surah_id = 111
+    s.ayah_id = last
+    s._init_guided()
+    s.audio.extend(b"\x00\x00" * 16000)
+    s._stall_ticks = main.STALL_ADVANCE_TICKS
+    calls = {"n": 0}
+    original_infer = ml_engine._infer_pred_ids
+    ml_engine._infer_pred_ids = lambda _b: (calls.__setitem__("n", calls["n"] + 1), [])[1]
+    try:
+        await s.tick()
+    finally:
+        ml_engine._infer_pred_ids = original_infer
+    assert calls["n"] == 0, "no inference must run at the last ayah"
+    assert s.resolved == (111, last), s.resolved
+    assert s.ws.sent, "interim must still stream"
+    print("LAST-AYAH OK -> no decode, no commit, interim still streams")
+
+
 if __name__ == "__main__":
     print("=== SINGLE ===")
     run_single()
@@ -574,4 +669,11 @@ if __name__ == "__main__":
     _multi_ayah_expected_span()
     asyncio.run(_guided_skips_clipped_first_word())
     asyncio.run(_burst_phrase_feed_locks_whole_phrase())
+    _window_byte_contract()
+    _advance_from_head_only_commits_next()
+    _advance_single_token_stays_quiet()
+    _advance_noisy_head_still_commits()
+    _advance_shared_opening_picks_correct_ayah()
+    _advance_junk_and_tail_only_never_commit()
+    asyncio.run(_advance_at_last_ayah_stays_quiet())
     print("ALL SMOKE TESTS PASSED")

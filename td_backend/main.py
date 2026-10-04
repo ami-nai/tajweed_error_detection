@@ -38,24 +38,27 @@ MIN_RESOLVE_TOKENS = 5
 # assume the user has moved on and re-resolve the ayah on a recent-token window.
 STALL_ADVANCE_TICKS = 3
 # Phase A live decode: each speech beat decodes this trailing context window
-# (3 s, exactly the streaming training window) and emits only the
+# (exactly the 3 s / 48000-sample training window) and emits only the
 # newly-covered frames (see decode_live_window).
 # Right-context lookahead in frames: the emitted slice always ends this far
 # before the newest audio so no emitted frame decodes with "silence ahead".
 # (No trailing zero-pad: the streaming model never saw padding.)
-LIVE_WINDOW_SAMPLES = 48000
+# NOTE: session.audio is a bytearray of int16 PCM, so every window below is
+# denominated in BYTES (samples x 2). An earlier revision used sample counts
+# here, silently halving every window to 1.5 s.
+LIVE_WINDOW_BYTES = 96000  # 48000 samples x 2 = 3.0 s @16 kHz mono int16
 LIVE_LEAD_FRAMES = 16
 # Phrase-level decisions (advance + in-ayah smooth follow) decode the trailing
 # audio in ONE full-context pass instead of the chopped 0.5 s-slice strip,
 # which our offline experiment measured as the weakest signal class.
-# Capped at 3 s: the streaming model was trained on exactly-3 s windows, so
-# longer one-pass decodes are out-of-contract (verify on Kaggle before raising).
-STALL_DECODE_SAMPLES = LIVE_WINDOW_SAMPLES  # ~3 s of audio
+# True 3 s: the streaming model was trained on exactly-3 s windows, so longer
+# one-pass decodes are out-of-contract (verify on Kaggle before raising).
+STALL_DECODE_BYTES = LIVE_WINDOW_BYTES  # 3 s of audio
 # Smallest speech burst worth a phrase-level decode (0.5 s at 16 kHz).
-MIN_PHRASE_BYTES = 8000
+MIN_PHRASE_BYTES = 16000  # 8000 samples x 2
 # Mid-burst phrase re-decode cadence: bytes of NEW speech since the last feed
 # that forces another phrase-level decode while a long burst is still going.
-PHRASE_REDECODE_BYTES = 48000  # ~3 s
+PHRASE_REDECODE_BYTES = 96000  # ~3 s
 
 
 def _rms(audio_bytes: bytes) -> float:
@@ -251,7 +254,7 @@ class Session:
                 # Phase A: decode the trailing context window, emit only the
                 # newly-covered frames (frame-index slicing + LEAD lookahead
                 # + collapse carryover inside decode_live_window).
-                start = max(0, n - LIVE_WINDOW_SAMPLES)
+                start = max(0, n - LIVE_WINDOW_BYTES)
                 window = bytes(self.audio[start:])
                 new_frames = int(round(new_samples / CTC_STRIDE))
                 tok, self._win_prev = await asyncio.to_thread(
@@ -354,6 +357,17 @@ class Session:
             print(f"🔍 [ADVANCE] skip: scanning={self._om_scanning} "
                   f"resolved={self.resolved} guided={self.guided is not None}")
             return
+        # Terminal ayah: nothing later exists in this surah (cross-surah
+        # advance is out of scope). Stop retrying so the log — and the GPU —
+        # stay quiet; interim streaming continues normally.
+        later = [a for a in get_surah_ayah_ids(self.surah_id) if a > self.ayah_id]
+        if not later:
+            self._stall_ticks = 0
+            marker = (self.surah_id, self.ayah_id)
+            if getattr(self, "_last_ayah_notice", None) != marker:
+                self._last_ayah_notice = marker
+                print(f"🏁 [ADVANCE] at last ayah {marker}: nothing later to resolve")
+            return
         # Cooldown: at most one attempt per STALL_ADVANCE_TICKS beats. Each
         # attempt is a self-contained fresh decode of the recent audio, so the
         # old "did the token window grow?" guard is meaningless here.
@@ -366,7 +380,7 @@ class Session:
         decode_str = ""
         try:
             end = len(self.audio)
-            start = max(0, end - STALL_DECODE_SAMPLES)
+            start = max(0, end - STALL_DECODE_BYTES)
             if end - start < MIN_PHRASE_BYTES:
                 print(f"🔍 [ADVANCE] need-more-audio: bytes={end - start}")
                 return

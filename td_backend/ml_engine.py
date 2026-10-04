@@ -316,7 +316,7 @@ def decode_live_window(window_bytes: bytes, new_frames: int, prev, is_first: boo
     """Phase A live decode: infer CTC ids over a trailing context window, then
     collapse ONLY the newly-covered frames.
 
-    window_bytes: trailing-window PCM (up to LIVE_WINDOW_SAMPLES of audio).
+    window_bytes: trailing-window PCM (up to LIVE_WINDOW_BYTES of audio).
     new_frames: output frames corresponding to audio not yet emitted.
     prev: collapse carryover from the previous slice (None to start fresh).
     is_first: first decode of the session -> emit from frame 0.
@@ -878,6 +878,56 @@ def resolve_ayah(pred_str, surahs=None, err_rate=0.35, min_tokens=5):
 
 _ADVANCE_MIN_ANCHOR = 5
 _ADVANCE_ERR_RATE = 0.35
+# Prefix-advance: leading tokens of a later ayah matched against the window
+# tail. Fires ~2 words into the next ayah instead of needing the whole ayah
+# in one window (which a 3 s window can never hold for longer ayahs).
+_ADVANCE_HEAD_TOKENS = 12
+_ADVANCE_TAIL_SLACK = 10
+
+
+def match_ayah_head(stream, pred_str, head_tokens=_ADVANCE_HEAD_TOKENS):
+    """Prefix-anchored alignment for progressive reading: does the TAIL of the
+    predicted stream match the HEAD of an ayah's canonical stream? Returns
+    (span_len, dist, score) or None. This sees what the full-stream matcher
+    cannot: a window holding only the first words of the next ayah (the normal
+    case 1-2 s into it). The head is long enough (~12 tokens) that shared
+    two-word openings (e.g. 113:4/113:5 'وَمِن شَرِّ') diverge beyond budget,
+    so only the ayah actually being read matches."""
+    target = strip_diacritics(stream)
+    body = strip_diacritics(pred_str or "")
+    head = target[:head_tokens]
+    if len(head) < _ADVANCE_MIN_ANCHOR or not body:
+        return None
+    # Only the newest tokens matter: the user is wherever the tail is.
+    tail = body[max(0, len(body) - len(head) - _ADVANCE_TAIL_SLACK):]
+    budget = max(1, int(len(head) * _ADVANCE_ERR_RATE))
+    if head in tail:
+        return (len(head), 0, 1.0)
+    if len(tail) >= len(head):
+        best = None
+        for i in range(len(tail) - len(head) + 1):
+            sub = tail[i:i + len(head)]
+            dist = Levenshtein.distance(sub, head)
+            if best is None or dist < best:
+                best = dist
+            if dist <= budget:
+                break
+        if best is not None and best <= budget:
+            return (len(head), best, round(1.0 - best / len(head), 4))
+    # Second chance: suffix-anchored multi-length compare. The newest k tokens
+    # against the head opening — residue-free by construction (no sliding over
+    # previous-ayah tokens), so decoded noise is the only budget consumer.
+    # Scanned longest-first: the longest anchor wins (most specific).
+    # Complements sliding above, whose fixed windows always include residue
+    # when the new ayah just started.
+    for k in range(min(len(head), len(tail)), 7, -1):
+        sub, pre = tail[-k:], head[:k]
+        dist = Levenshtein.distance(sub, pre)
+        if dist <= max(1, int(k * _ADVANCE_ERR_RATE)):
+            return (k, dist, round(1.0 - dist / k, 4))
+    # Shorter/ambiguous tails stay quiet: the next retry (1.5 s later, more
+    # tokens) decides instead of guessing.
+    return None
 
 
 def match_ayah_in_stream(stream, pred_str):
@@ -919,15 +969,35 @@ def match_ayah_in_stream(stream, pred_str):
 
 
 def advance_target(pred_str, cur_s, cur_a, allowed_surahs=None):
-    """Find the FURTHEST later ayah of surah `cur_s` whose canonical stream is
-    best-aligned anywhere within pred_str with enough anchor coverage. Returns
-    (surah_id, ayah_id, score) or None. Walking later ayahs in order and keeping
-    the last genuine match biases the answer to wherever the user has actually
-    reached (their latest decoded tokens sit at the tail of the window)."""
+    """Find the later ayah of surah `cur_s` the user has reached.
+    Two passes, same return (surah_id, ayah_id, score) or None:
+
+    1. Prefix pass: the window tail against each later ayah's HEAD. This is
+       the progressive-reading case — 1-2 s into the next ayah — which the
+       full-stream matcher below can never see (a 3 s window cannot hold a
+       whole longer ayah). NEAREST-wins: later ayahs are checked in order and
+       the first head match commits, because shared two-word openings (e.g.
+       113:4/113:5) would otherwise let a further ayah shadow the one being
+       read. A spurious shared-head commit self-corrects on the next retry.
+    2. Fallback: the legacy full-stream match-anywhere (window holds the whole
+       ayah: short ayahs fully inside the window), furthest-wins — full
+       streams are distinctive, so furthest is safe here and still catches
+       genuine ayah skips."""
     if allowed_surahs is not None and cur_s not in allowed_surahs:
         return None
     if not pred_str or len(strip_diacritics(pred_str)) < _ADVANCE_MIN_ANCHOR:
         return None
+    for a_id in get_surah_ayah_ids(cur_s):
+        if a_id <= cur_a:
+            continue
+        stream = TAJWEED_ONLY_INDEX[cur_s][a_id]["expected_full"]
+        m = match_ayah_head(stream, pred_str)
+        if m is None:
+            continue
+        span_len, _dist, score = m
+        if span_len < _ADVANCE_MIN_ANCHOR:
+            continue
+        return (cur_s, a_id, score)
     best = None
     for a_id in get_surah_ayah_ids(cur_s):
         if a_id <= cur_a:
