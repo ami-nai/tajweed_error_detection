@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/recitation_provider.dart';
 import '../../domain/entities/recitation_result.dart';
+import 'measurement_page.dart';
 
 class RecitationPage extends ConsumerWidget {
   const RecitationPage({Key? key}) : super(key: key);
@@ -168,6 +169,18 @@ class RecitationPage extends ConsumerWidget {
                   onPressed: recitationState.status != RecitationStatus.recording
                       ? null
                       : () => notifier.stopReciting(),
+                ),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  icon: const Icon(Icons.analytics_outlined, size: 18),
+                  label: const Text('Measurements', style: TextStyle(fontSize: 14)),
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const MeasurementPage()),
+                  ),
                 ),
               ],
             ),

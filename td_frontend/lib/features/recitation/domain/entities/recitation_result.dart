@@ -89,6 +89,16 @@ class RecitationResult {
   final Map<int, String> ayahExpected;
   final Map<int, String> ayahPredicted;
 
+  // Thesis round-trip measurement (edge device, same-device clock):
+  // per-beat mic-send -> interim-recv latency in ms. Empty/zero until the
+  // first interim of a recording arrives; reset on every new recording.
+  final List<int> rttSamples;
+  final int rttLastMs;
+  final int rttMedianMs;
+  final int rttMinMs;
+  final int rttMaxMs;
+  final int rttBeats;
+
   RecitationResult({
     required this.words,
     this.status = RecitationStatus.idle,
@@ -116,6 +126,12 @@ class RecitationResult {
     Map<int, List<DiffHit>>? ayahDiffs,
     Map<int, String>? ayahExpected,
     Map<int, String>? ayahPredicted,
+    List<int>? rttSamples,
+    this.rttLastMs = 0,
+    this.rttMedianMs = 0,
+    this.rttMinMs = 0,
+    this.rttMaxMs = 0,
+    this.rttBeats = 0,
   })  : surahWords = surahWords ?? {},
         ayahAccuracies = ayahAccuracies ?? {},
         ayahPER = ayahPER ?? {},
@@ -124,7 +140,8 @@ class RecitationResult {
         ayahMistakes = ayahMistakes ?? {},
         ayahDiffs = ayahDiffs ?? {},
         ayahExpected = ayahExpected ?? {},
-        ayahPredicted = ayahPredicted ?? {};
+        ayahPredicted = ayahPredicted ?? {},
+        rttSamples = rttSamples ?? [];
 
   factory RecitationResult.initial() {
     return RecitationResult(
@@ -179,6 +196,12 @@ class RecitationResult {
     Map<int, List<DiffHit>>? ayahDiffs,
     Map<int, String>? ayahExpected,
     Map<int, String>? ayahPredicted,
+    List<int>? rttSamples,
+    int? rttLastMs,
+    int? rttMedianMs,
+    int? rttMinMs,
+    int? rttMaxMs,
+    int? rttBeats,
   }) {
     return RecitationResult(
       words: words ?? this.words,
@@ -211,6 +234,12 @@ class RecitationResult {
       ayahDiffs: ayahDiffs ?? this.ayahDiffs,
       ayahExpected: ayahExpected ?? this.ayahExpected,
       ayahPredicted: ayahPredicted ?? this.ayahPredicted,
+      rttSamples: rttSamples ?? this.rttSamples,
+      rttLastMs: rttLastMs ?? this.rttLastMs,
+      rttMedianMs: rttMedianMs ?? this.rttMedianMs,
+      rttMinMs: rttMinMs ?? this.rttMinMs,
+      rttMaxMs: rttMaxMs ?? this.rttMaxMs,
+      rttBeats: rttBeats ?? this.rttBeats,
     );
   }
 }

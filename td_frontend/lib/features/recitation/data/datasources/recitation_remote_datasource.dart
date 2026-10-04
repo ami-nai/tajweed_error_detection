@@ -64,13 +64,27 @@ class RecitationRemoteDataSource {
   StreamSubscription<Uint8List>? _micStreamSubscription;
   bool _channelClosed = false;
 
-  // Thesis round-trip logging (logging only — no behavior change): monotonic
-  // chunk sequence + wall-ms + cumulative bytes. Pair offline with the
-  // server interim's `audio_bytes` offset (T_recv minus T_send of the chunk
-  // covering that offset). Same-device clock throughout, no sync needed.
+  // Thesis round-trip measurement (logging only — no behavior change):
+  // per-chunk send records (sequence, wall-ms, cumulative bytes). The provider
+  // pairs these with each interim's `audio_bytes` offset; same-device clock
+  // throughout, so mic-send -> interim-recv needs no clock sync.
   int _micSeq = 0;
   int _micBytesTotal = 0;
-  final Stopwatch _micSw = Stopwatch();
+  final List<_MicSend> _micLog = [];
+
+  /// Round-trip ms for the interim that consumed [audioBytes]: receive time
+  /// minus the send time of the first chunk covering that offset. Null when
+  /// nothing was consumed yet or the offset predates the retained log.
+  int? rttForAudioBytes(int audioBytes, int recvMs) {
+    if (audioBytes <= 0) return null;
+    for (final e in _micLog) {
+      if (e.total >= audioBytes) {
+        final rtt = recvMs - e.ms;
+        return rtt >= 0 ? rtt : null;
+      }
+    }
+    return null;
+  }
 
   RecitationRemoteDataSource(this.baseUrl);
 
@@ -95,9 +109,7 @@ class RecitationRemoteDataSource {
     _channelClosed = false;
     _micSeq = 0;
     _micBytesTotal = 0;
-    _micSw
-      ..reset()
-      ..start();
+    _micLog.clear();
     _channel = WebSocketChannel.connect(Uri.parse('$baseUrl/ws/recite'));
 
     // 1. Send the identifying target Surah metadata string (with explicit mode)
@@ -125,7 +137,13 @@ class RecitationRemoteDataSource {
         try {
           _channel?.sink.add(data);
           _micBytesTotal += data.length;
-          print("🎙️ [MIC SEND] seq=${_micSeq++} ms=${_micSw.elapsedMilliseconds} "
+          final seq = _micSeq++;
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          _micLog.add(_MicSend(seq, nowMs, _micBytesTotal));
+          if (_micLog.length > 400) {
+            _micLog.removeRange(0, _micLog.length - 400);
+          }
+          print("🎙️ [MIC SEND] seq=$seq ms=$nowMs "
               "bytes=${data.length} total=$_micBytesTotal");
         } on StateError {
           _channelClosed = true;
@@ -199,4 +217,13 @@ class RecitationRemoteDataSource {
       await _channel?.sink.close();
     } catch (_) {}
   }
+}
+
+/// One microphone chunk send, for thesis round-trip measurement.
+class _MicSend {
+  final int seq;
+  final int ms;
+  final int total;
+
+  const _MicSend(this.seq, this.ms, this.total);
 }

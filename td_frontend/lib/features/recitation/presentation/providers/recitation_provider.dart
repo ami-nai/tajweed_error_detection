@@ -231,6 +231,45 @@ final repositoryProvider = Provider<RecitationRepository>((ref) {
 class RecitationNotifier extends Notifier<RecitationResult> {
   StreamSubscription? _serverSubscription;
 
+  /// Median of per-beat round-trip samples (ms). Pure function for testability.
+  static int medianRtt(List<int> samples) {
+    if (samples.isEmpty) return 0;
+    final sorted = List<int>.from(samples)..sort();
+    final mid = sorted.length ~/ 2;
+    return sorted.length.isOdd ? sorted[mid] : ((sorted[mid - 1] + sorted[mid]) ~/ 2);
+  }
+
+  /// Fold one interim's round-trip sample into the measurement state.
+  /// Same-device clock throughout (mic-send wall-ms vs interim-recv wall-ms).
+  void _recordRttSample(Map<String, dynamic> data) {
+    final consumed = (data['audio_bytes'] as num?)?.toInt();
+    if (consumed == null) return;
+    final recvMs = DateTime.now().millisecondsSinceEpoch;
+    final rtt = ref.read(dataSourceProvider).rttForAudioBytes(consumed, recvMs);
+    if (rtt == null) return;
+    final samples = List<int>.from(state.rttSamples)..add(rtt);
+    var minMs = state.rttMinMs;
+    var maxMs = state.rttMaxMs;
+    if (state.rttBeats == 0) {
+      minMs = rtt;
+      maxMs = rtt;
+    } else {
+      if (rtt < minMs) minMs = rtt;
+      if (rtt > maxMs) maxMs = rtt;
+    }
+    state = state.copyWith(
+      rttSamples: samples,
+      rttLastMs: rtt,
+      rttMedianMs: medianRtt(samples),
+      rttMinMs: minMs,
+      rttMaxMs: maxMs,
+      rttBeats: state.rttBeats + 1,
+    );
+  }
+
+  /// Zeroed measurement fields for every fresh recording / context switch.
+  static const List<int> _noRttSamples = <int>[];
+
   @override
   RecitationResult build() {
     ref.onDispose(() {
@@ -297,6 +336,12 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         livePhonemes: '',
         surahWords: _seedSurahWords(state.selectedSurah),
         activeWordIndex: null,
+        rttSamples: _noRttSamples,
+        rttLastMs: 0,
+        rttMedianMs: 0,
+        rttMinMs: 0,
+        rttMaxMs: 0,
+        rttBeats: 0,
       );
       _clearAyahMetrics();
     }
@@ -318,6 +363,12 @@ class RecitationNotifier extends Notifier<RecitationResult> {
         livePhonemes: '',
         surahWords: _seedSurahWords(surahId),
         activeWordIndex: null,
+        rttSamples: _noRttSamples,
+        rttLastMs: 0,
+        rttMedianMs: 0,
+        rttMinMs: 0,
+        rttMaxMs: 0,
+        rttBeats: 0,
       );
       _clearAyahMetrics();
     }
@@ -332,6 +383,12 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       mode: RecitationMode.singleAyah,
       words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
       activeWordIndex: 0,
+      rttSamples: _noRttSamples,
+      rttLastMs: 0,
+      rttMedianMs: 0,
+      rttMinMs: 0,
+      rttMaxMs: 0,
+      rttBeats: 0,
     );
   }
 
@@ -357,6 +414,12 @@ class RecitationNotifier extends Notifier<RecitationResult> {
       surahPER: 0,
       diff: [],
       activeWordIndex: 0,
+      rttSamples: _noRttSamples,
+      rttLastMs: 0,
+      rttMedianMs: 0,
+      rttMinMs: 0,
+      rttMaxMs: 0,
+      rttBeats: 0,
     );
   }
 
@@ -376,10 +439,25 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           status: RecitationStatus.recording,
           words: staticWords.map((w) => WordTrackResult(text: w, isRead: false)).toList(),
           activeWordIndex: 0,
+          rttSamples: _noRttSamples,
+          rttLastMs: 0,
+          rttMedianMs: 0,
+          rttMinMs: 0,
+          rttMaxMs: 0,
+          rttBeats: 0,
         );
       } else if (state.mode == RecitationMode.surah) {
         _loadSurah(surahId);
-        state = state.copyWith(status: RecitationStatus.recording, activeWordIndex: 0);
+        state = state.copyWith(
+          status: RecitationStatus.recording,
+          activeWordIndex: 0,
+          rttSamples: _noRttSamples,
+          rttLastMs: 0,
+          rttMedianMs: 0,
+          rttMinMs: 0,
+          rttMaxMs: 0,
+          rttBeats: 0,
+        );
       } else {
         // Open Mic: words are seeded once the server detects an ayah; the full
         // surah is already on screen and highlighting follows detection.
@@ -390,6 +468,12 @@ class RecitationNotifier extends Notifier<RecitationResult> {
           livePhonemes: '',
           surahWords: _seedSurahWords(surahId),
           activeWordIndex: null,
+          rttSamples: _noRttSamples,
+          rttLastMs: 0,
+          rttMedianMs: 0,
+          rttMinMs: 0,
+          rttMaxMs: 0,
+          rttBeats: 0,
         );
         _clearAyahMetrics();
       }
@@ -413,6 +497,11 @@ class RecitationNotifier extends Notifier<RecitationResult> {
                   "active_index=${data['active_index']}");
             }
             _handleServerPayload(data);
+            // Thesis measurement (logging/state only): fold the beat's
+            // round-trip into the rolling stats AFTER the payload applied.
+            if (data['final'] != true) {
+              _recordRttSample(data);
+            }
           } catch (payloadError) {
             // A single malformed message must never tear down the stream.
             print("❌ [PAYLOAD ERROR] Ignoring malformed server message: $payloadError");
