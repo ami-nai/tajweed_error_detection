@@ -58,6 +58,7 @@ conversation_context.md
 spotlight_changes.md
 .opencode/
 *.m4a
+*.wav
 
 # ==========================================
 # Global / OS / IDEs
