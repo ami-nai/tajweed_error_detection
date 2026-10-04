@@ -369,21 +369,14 @@ def _load_audio_bytes(audio_path: str) -> bytes:
     return pcm.tobytes()
 
 
-# Leading digital silence prepended to every final-scoring decode. Gives the
-# conv frontend left context so the span's first phonemes don't fall in the
-# edge-instability zone (measured: file takes starting abruptly lose their
-# opening, e.g. ayah 2's مَا). File-final path only — live tick/phrase decodes
-# never touch this (mic windows always have real left context or overlap).
-FRONT_PAD_SAMPLES = 6400  # ~0.4 s of silence
-
-
 def _predict_phonemes(audio_path: str) -> str:
     """Load an audio file (any rate/channels, or a headerless raw segment)
     and run model inference, returning the decoded phoneme prediction string
-    (shared by evaluate_audio and sequential mode). Leading silence pad per
-    FRONT_PAD_SAMPLES; the CTC collapse drops it (blanks), so only edge
-    context changes, never content."""
-    return _bytes_to_prediction(b"\x00" * (FRONT_PAD_SAMPLES * 2) + _load_audio_bytes(audio_path))
+    (shared by evaluate_audio and sequential mode). Decodes the exact loaded
+    bytes — no padding: a front-pad trial on Kaggle showed no onset recovery
+    (the مَا-type onset loss is model repeat-count bias, not edge
+    instability) while adding an unverified variable to finals."""
+    return _bytes_to_prediction(_load_audio_bytes(audio_path))
 
 
 def DIACRITICS_STRIP():

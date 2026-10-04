@@ -642,10 +642,10 @@ async def _advance_at_last_ayah_stays_quiet():
     print("LAST-AYAH OK -> no decode, no commit, interim still streams")
 
 
-def _front_pad_prepended_to_final_decodes():
-    # Final-scoring decodes carry leading silence (left context for the span's
-    # first phonemes); live paths must not. Capture the exact bytes reaching
-    # the collapse stage for a headerless raw segment.
+def _final_decodes_use_exact_file_bytes():
+    # Final-scoring decodes receive the loaded bytes verbatim — no padding.
+    # (A front-pad trial showed no onset recovery on Kaggle, so finals stay
+    # on the exact verified decode path. Live paths never touch this either.)
     captured = {}
     original_btp = ml_engine._bytes_to_prediction
     ml_engine._bytes_to_prediction = lambda b: (captured.__setitem__("n", len(b)), "")[1]
@@ -656,8 +656,8 @@ def _front_pad_prepended_to_final_decodes():
         ml_engine._predict_phonemes("/tmp/pad_probe.raw")
     finally:
         ml_engine._bytes_to_prediction = original_btp
-    assert captured.get("n") == len(raw) + ml_engine.FRONT_PAD_SAMPLES * 2, captured
-    print("FRONT-PAD OK -> final decodes lead with silence, content untouched")
+    assert captured.get("n") == len(raw), captured
+    print("NO-PAD OK -> final decodes use exact file bytes")
 
 
 def _evaluate_audio_accepts_shared_pred():
@@ -802,7 +802,7 @@ if __name__ == "__main__":
     _advance_shared_opening_picks_correct_ayah()
     _advance_junk_and_tail_only_never_commit()
     asyncio.run(_advance_at_last_ayah_stays_quiet())
-    _front_pad_prepended_to_final_decodes()
+    _final_decodes_use_exact_file_bytes()
     _evaluate_audio_accepts_shared_pred()
     _evaluate_span_scores_whole_recitation()
     asyncio.run(_finalize_open_mic_covers_span())
