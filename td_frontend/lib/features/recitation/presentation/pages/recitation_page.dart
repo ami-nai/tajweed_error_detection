@@ -15,14 +15,9 @@ class RecitationPage extends ConsumerWidget {
     final bool isSurahMode = recitationState.mode == RecitationMode.surah;
     final bool isOpenMic = recitationState.mode == RecitationMode.openMic;
 
-    // Dynamic Ayah boundary lookup based on current selection configurations
-    final int maxAyahs = recitationState.selectedSurah == 111
-        ? 5
-        : recitationState.selectedSurah == 112
-            ? 4
-            : recitationState.selectedSurah == 113
-                ? 5
-                : 6;
+    // Ayah count comes from the local surah database, so every surah in the
+    // backend index works with zero per-surah UI edits.
+    final int maxAyahs = quranTextDatabase[recitationState.selectedSurah]?.length ?? 0;
 
     return Scaffold(
       appBar: AppBar(
@@ -83,11 +78,11 @@ class RecitationPage extends ConsumerWidget {
                   children: [
                     DropdownButton<int>(
                       value: recitationState.selectedSurah,
-                      items: const [
-                        DropdownMenuItem(value: 111, child: Text('Surah 111 (Al-Masad)')),
-                        DropdownMenuItem(value: 112, child: Text('Surah 112 (Al-Ikhlas)')),
-                        DropdownMenuItem(value: 113, child: Text('Surah 113 (Al-Falaq)')),
-                        DropdownMenuItem(value: 114, child: Text('Surah 114 (An-Nas)')),
+                      // All surahs present in the backend index (see surahLabels;
+                      // 96/98/100/101 have no model data and are excluded).
+                      items: [
+                        for (final s in (quranTextDatabase.keys.toList()..sort()))
+                          DropdownMenuItem(value: s, child: Text(surahLabels[s] ?? 'Surah $s')),
                       ],
                       // Block selection changes while recording is running
                       onChanged: recitationState.status == RecitationStatus.recording
